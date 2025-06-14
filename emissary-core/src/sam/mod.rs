@@ -198,7 +198,7 @@ pub struct SamServer<R: Runtime> {
     ///
     /// Inbound connections which are in the state of being handshaked and reading a command from
     /// the client. After the command has been read, `SamServer` validates it against the current
-    /// state, ensuring, e.g., that the it's not a duplicate `SESSION CREATE` request.
+    /// state, ensuring, e.g., that it's not a duplicate `SESSION CREATE` request.
     pending_inbound_connections: R::JoinSet<crate::Result<ConnectionKind<R>>>,
 
     /// Pending SAMv3 sessions that are in the process of building a tunnel pool.
@@ -447,10 +447,27 @@ impl<R: Runtime> Future for SamServer<R> {
                         // the constructed pool is not ready for immediate use and must be polled
                         // until the desired amount of inbound/outbound tunnels have been built at
                         // which point an active samv3 session can be constructed
-                        let tunnel_pool_future =
+                        let tunnel_pool_future = {
+                            let default_tpc = TunnelPoolConfig::default(); // default tunnel pool configuration cached for faster access
+
                             match this.tunnel_manager_handle.create_tunnel_pool(TunnelPoolConfig {
                                 name: Str::from(Arc::clone(&session_id)),
-                                ..Default::default()
+                                num_inbound: options
+                                    .get("inbound.quantity")
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(default_tpc.num_inbound),
+                                num_inbound_hops: options
+                                    .get("inbound.length")
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(default_tpc.num_inbound_hops),
+                                num_outbound: options
+                                    .get("outbound.quantity")
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(default_tpc.num_outbound),
+                                num_outbound_hops: options
+                                    .get("outbound.length")
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(default_tpc.num_outbound_hops),
                             }) {
                                 Ok(tunnel_pool_future) => tunnel_pool_future,
                                 Err(error) => {
@@ -462,7 +479,8 @@ impl<R: Runtime> Future for SamServer<R> {
                                     );
                                     continue;
                                 }
-                            };
+                            }
+                        };
 
                         let (tx, rx) =
                             with_recycle(COMMAND_CHANNEL_SIZE, SamSessionCommandRecycle::default());
