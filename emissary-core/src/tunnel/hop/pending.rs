@@ -193,11 +193,7 @@ impl<T: Tunnel> PendingTunnel<T> {
                 let mut record = router_id[..16].to_vec();
 
                 record.extend_from_slice(&{
-                    let mut fake_key = [0u8; 32];
-                    R::rng().fill_bytes(&mut fake_key);
-
-                    fake_key[31] &= !0x80;
-                    fake_key
+                    EphemeralPrivateKey::random(R::rng()).public().to_vec()
                 });
                 record.extend_from_slice(&{
                     // record len - short router hash - public key
