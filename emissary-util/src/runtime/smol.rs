@@ -16,7 +16,6 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use async_std::net;
 use emissary_core::runtime::{
     AsyncRead, AsyncWrite, Counter, Gauge, Histogram, Instant as InstantT, JoinSet, MetricType,
     MetricsHandle, Runtime as RuntimeT, TcpListener, TcpStream, UdpSocket,
@@ -26,12 +25,10 @@ use flate2::{
     Compression,
 };
 use futures::{
-    channel::mpsc::{channel, Receiver, Sender},
-    future::BoxFuture,
-    stream::{BoxStream, FuturesUnordered},
-    AsyncRead as _, AsyncWrite as _, FutureExt, Stream, StreamExt,
+    future::BoxFuture, ready, stream::FuturesUnordered, AsyncRead as _, AsyncWrite as _, Stream,
 };
 use rand_core::{CryptoRng, RngCore};
+use smol::{future::FutureExt, stream::StreamExt, Async};
 
 #[cfg(feature = "metrics")]
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
@@ -43,14 +40,15 @@ use std::{
     io::Write,
     net::SocketAddr,
     pin::{pin, Pin},
+    sync::Arc,
     task::{Context, Poll, Waker},
     time::{Duration, Instant, SystemTime},
 };
 
-/// Logging targer for the file.
-const LOG_TARGET: &str = "emissary::runtime::async-std";
+/// Logging target for the file.
+const LOG_TARGET: &str = "emissary::runtime::smol";
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct Runtime {}
 
 impl Runtime {
@@ -59,21 +57,15 @@ impl Runtime {
     }
 }
 
-impl Default for Runtime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub struct SmolTcpStream(Async<std::net::TcpStream>);
 
-pub struct AsyncStdTcpStream(net::TcpStream);
-
-impl AsyncStdTcpStream {
-    fn new(stream: net::TcpStream) -> Self {
+impl SmolTcpStream {
+    fn new(stream: Async<std::net::TcpStream>) -> Self {
         Self(stream)
     }
 }
 
-impl AsyncRead for AsyncStdTcpStream {
+impl AsyncRead for SmolTcpStream {
     #[inline]
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -82,14 +74,14 @@ impl AsyncRead for AsyncStdTcpStream {
     ) -> Poll<emissary_core::Result<usize>> {
         let pinned = pin!(&mut self.0);
 
-        match futures::ready!(pinned.poll_read(cx, buf)) {
+        match ready!(pinned.poll_read(cx, buf)) {
             Ok(nread) => Poll::Ready(Ok(nread)),
             Err(error) => Poll::Ready(Err(emissary_core::Error::Custom(error.to_string()))),
         }
     }
 }
 
-impl AsyncWrite for AsyncStdTcpStream {
+impl AsyncWrite for SmolTcpStream {
     #[inline]
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -98,7 +90,7 @@ impl AsyncWrite for AsyncStdTcpStream {
     ) -> Poll<emissary_core::Result<usize>> {
         let pinned = pin!(&mut self.0);
 
-        match futures::ready!(pinned.poll_write(cx, buf)) {
+        match ready!(pinned.poll_write(cx, buf)) {
             Ok(nwritten) => Poll::Ready(Ok(nwritten)),
             Err(error) => Poll::Ready(Err(emissary_core::Error::Custom(error.to_string()))),
         }
@@ -111,7 +103,7 @@ impl AsyncWrite for AsyncStdTcpStream {
     ) -> Poll<emissary_core::Result<()>> {
         let pinned = pin!(&mut self.0);
 
-        match futures::ready!(pinned.poll_flush(cx)) {
+        match ready!(pinned.poll_flush(cx)) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(error) => Poll::Ready(Err(emissary_core::Error::Custom(error.to_string()))),
         }
@@ -124,87 +116,109 @@ impl AsyncWrite for AsyncStdTcpStream {
     ) -> Poll<emissary_core::Result<()>> {
         let pinned = pin!(&mut self.0);
 
-        match futures::ready!(pinned.poll_close(cx)) {
+        match ready!(pinned.poll_close(cx)) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(error) => Poll::Ready(Err(emissary_core::Error::Custom(error.to_string()))),
         }
     }
 }
 
-impl TcpStream for AsyncStdTcpStream {
+impl TcpStream for SmolTcpStream {
     async fn connect(address: SocketAddr) -> Option<Self> {
-        match async_std::future::timeout(Duration::from_secs(10), net::TcpStream::connect(address))
-            .await
-        {
-            Err(_) => {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    ?address,
-                    "timeout while dialing address",
-                );
-                None
+        let connect_future = async {
+            match Async::<std::net::TcpStream>::connect(address).await {
+                Ok(stream) => {
+                    if let Err(e) = stream.get_ref().set_nodelay(true) {
+                        return Some(Err(e));
+                    }
+                    Some(Ok(stream))
+                }
+                Err(e) => Some(Err(e)),
             }
-            Ok(Err(error)) => {
+        };
+
+        let timeout_future = async {
+            smol::Timer::after(Duration::from_secs(10)).await;
+            None
+        };
+
+        // Ad-hoc timeout on future completion
+        match connect_future.race(timeout_future).await {
+            Some(Ok(stream)) => Some(Self::new(stream)),
+            Some(Err(error)) => {
                 tracing::debug!(
                     target: LOG_TARGET,
                     ?address,
                     error = ?error.kind(),
-                    "failed to connect"
+                    "Connection failed"
                 );
                 None
             }
-            Ok(Ok(stream)) => Some(Self::new(stream)),
+            None => {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    ?address,
+                    "Connection timed out"
+                );
+                None
+            }
         }
     }
 }
 
-pub struct AsyncStdTcpListener(
-    (
-        SocketAddr,
-        BoxStream<'static, async_std::io::Result<net::TcpStream>>,
-    ),
-);
+pub struct SmolTcpListener(Async<std::net::TcpListener>);
 
-impl TcpListener<AsyncStdTcpStream> for AsyncStdTcpListener {
+impl TcpListener<SmolTcpStream> for SmolTcpListener {
     // TODO: can be made sync with `socket2`
     async fn bind(address: SocketAddr) -> Option<Self> {
-        net::TcpListener::bind(&address)
-            .await
+        Async::<std::net::TcpListener>::bind(address)
             .map_err(|error| {
                 tracing::debug!(
                     target: LOG_TARGET,
                     ?address,
-                    ?error,
+                    error = ?error.kind(),
                     "failed to bind"
                 );
             })
             .ok()
-            .map(|listener| {
-                let address = listener.local_addr().expect("to succeed");
-
-                AsyncStdTcpListener((address, Box::pin(listener.into_incoming())))
-            })
+            .map(SmolTcpListener)
     }
 
-    fn poll_accept(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<(AsyncStdTcpStream, SocketAddr)>> {
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Option<(SmolTcpStream, SocketAddr)>> {
         loop {
-            match futures::ready!(self.0 .1.poll_next_unpin(cx)) {
-                Some(Ok(stream)) => match stream.local_addr() {
-                    Ok(address) => return Poll::Ready(Some((AsyncStdTcpStream(stream), address))),
-                    Err(_) => continue,
+            match ready!(self.0.poll_readable(cx)) {
+                Ok(()) => match self.0.get_ref().accept() {
+                    Ok((stream, address)) => match stream.set_nodelay(true) {
+                        Ok(()) => match Async::new(stream) {
+                            Ok(async_stream) =>
+                                return Poll::Ready(Some((SmolTcpStream(async_stream), address))),
+                            Err(_) => return Poll::Ready(None),
+                        },
+                        Err(error) => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                ?error,
+                                "failed to configure `TCP_NODELAY` for inbound connection",
+                            );
+                            continue;
+                        }
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            ?error,
+                            "failed to accept connection",
+                        );
+                        return Poll::Ready(None);
+                    }
                 },
-                Some(Err(error)) => {
-                    tracing::warn!(
+                Err(error) => {
+                    tracing::debug!(
                         target: LOG_TARGET,
                         ?error,
-                        "failed to accept connection",
+                        "failed to poll socket readability",
                     );
-                    return Poll::Ready(None);
-                }
-                None => {
                     return Poll::Ready(None);
                 }
             }
@@ -212,131 +226,89 @@ impl TcpListener<AsyncStdTcpStream> for AsyncStdTcpListener {
     }
 
     fn local_address(&self) -> Option<SocketAddr> {
-        Some(self.0 .0)
+        self.0.get_ref().local_addr().ok()
     }
 }
 
-pub struct AsyncStdUdpSocket {
-    dgram_tx: Sender<(Vec<u8>, SocketAddr)>,
-    dgram_rx: Receiver<(Vec<u8>, SocketAddr)>,
-    local_address: Option<SocketAddr>,
-}
+#[derive(Clone)]
+pub struct SmolUdpSocket(Arc<Async<std::net::UdpSocket>>);
 
-impl AsyncStdUdpSocket {
-    fn new(socket: net::UdpSocket) -> Self {
-        let (send_tx, mut send_rx): (Sender<(Vec<u8>, SocketAddr)>, _) = channel(2048);
-        let (mut recv_tx, recv_rx) = channel(2048);
-        let local_address = socket.local_addr().ok();
-
-        async_std::task::spawn(async move {
-            let mut buffer = vec![0u8; 0xffff];
-
-            loop {
-                futures::select! {
-                    event = send_rx.next() => match event {
-                        Some((datagram, target)) => {
-                            if let Err(error) = socket.send_to(&datagram, target).await {
-                                tracing::debug!(
-                                    target: LOG_TARGET,
-                                    ?target,
-                                    ?error,
-                                    "failed to send datagram",
-                                );
-                            }
-                        }
-                        None => return,
-                    },
-                    event = socket.recv_from(&mut buffer).fuse() => match event {
-                        Ok((nread, sender)) => {
-                            if let Err(error) = recv_tx.try_send((buffer[..nread].to_vec(), sender)) {
-                                tracing::debug!(
-                                    target: LOG_TARGET,
-                                    ?sender,
-                                    ?error,
-                                    "failed to forward datagram",
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            tracing::debug!(
-                                target: LOG_TARGET,
-                                ?error,
-                                "socket error",
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-
-        Self {
-            dgram_tx: send_tx,
-            dgram_rx: recv_rx,
-            local_address,
-        }
-    }
-}
-
-impl UdpSocket for AsyncStdUdpSocket {
+impl UdpSocket for SmolUdpSocket {
     fn bind(address: SocketAddr) -> impl Future<Output = Option<Self>> {
-        async move { net::UdpSocket::bind(address).await.ok().map(Self::new) }
+        async move {
+            Async::<std::net::UdpSocket>::bind(address)
+                .ok()
+                .map(|socket| Self(Arc::new(socket)))
+        }
     }
 
     #[inline]
     fn poll_send_to(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<Option<usize>> {
-        let len = buf.len();
-        match self.dgram_tx.try_send((buf.to_vec(), target)) {
-            Ok(_) => Poll::Ready(Some(len)),
-            Err(error) => {
-                if error.is_full() {
+        loop {
+            match ready!(self.0.poll_writable(cx)) {
+                Ok(()) => match self.0.get_ref().send_to(buf, target) {
+                    Ok(n) => return Poll::Ready(Some(n)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            ?error,
+                            "failed to send datagram",
+                        );
+                        return Poll::Ready(None);
+                    }
+                },
+                Err(error) => {
                     tracing::warn!(
                         target: LOG_TARGET,
-                        "datagram channel clogged",
+                        ?error,
+                        "failed to poll socket writability",
                     );
-                    return Poll::Ready(Some(len));
+                    return Poll::Ready(None);
                 }
-
-                Poll::Ready(None)
             }
         }
     }
 
     #[inline]
     fn poll_recv_from(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Option<(usize, SocketAddr)>> {
-        match self.dgram_rx.poll_next_unpin(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some((datagram, from))) =>
-                if buf.len() < datagram.len() {
+        loop {
+            match ready!(self.0.poll_readable(cx)) {
+                Ok(()) => match self.0.get_ref().recv_from(buf) {
+                    Ok((n, addr)) => return Poll::Ready(Some((n, addr))),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            ?error,
+                            "failed to receive datagram",
+                        );
+                        return Poll::Ready(None);
+                    }
+                },
+                Err(error) => {
                     tracing::warn!(
                         target: LOG_TARGET,
-                        datagram_len = ?datagram.len(),
-                        buffer_len = ?buf.len(),
-                        "truncating datagram",
+                        ?error,
+                        "failed to poll socket readability",
                     );
-                    debug_assert!(false);
-                    buf.copy_from_slice(&datagram[..buf.len()]);
-
-                    Poll::Ready(Some((buf.len(), from)))
-                } else {
-                    buf[..datagram.len()].copy_from_slice(&datagram);
-                    Poll::Ready(Some((datagram.len(), from)))
-                },
+                    return Poll::Ready(None);
+                }
+            }
         }
     }
 
     fn local_address(&self) -> Option<SocketAddr> {
-        self.local_address
+        self.0.get_ref().local_addr().ok()
     }
 }
 
@@ -363,7 +335,7 @@ impl<T: Send + 'static> JoinSet<T> for FuturesJoinSet<T> {
         F: Future<Output = T> + Send + 'static,
         F::Output: Send,
     {
-        let handle = async_std::task::spawn(future);
+        let handle = smol::spawn(future);
 
         self.0.push(Box::pin(handle));
     }
@@ -375,15 +347,15 @@ impl<T: Send + 'static> Stream for FuturesJoinSet<T> {
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.0.is_empty() {
-            false => self.0.poll_next_unpin(cx),
+            false => self.0.poll_next(cx),
             true => Poll::Pending,
         }
     }
 }
 
-pub struct AsyncStdJoinSet<T>(FuturesJoinSet<T>, Option<Waker>);
+pub struct SmolJoinSet<T>(FuturesJoinSet<T>, Option<Waker>);
 
-impl<T: Send + 'static> JoinSet<T> for AsyncStdJoinSet<T> {
+impl<T: Send + 'static> JoinSet<T> for SmolJoinSet<T> {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -405,12 +377,12 @@ impl<T: Send + 'static> JoinSet<T> for AsyncStdJoinSet<T> {
     }
 }
 
-impl<T: Send + 'static> Stream for AsyncStdJoinSet<T> {
+impl<T: Send + 'static> Stream for SmolJoinSet<T> {
     type Item = T;
 
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.0.poll_next_unpin(cx) {
+        match self.0.poll_next(cx) {
             Poll::Pending | Poll::Ready(None) => {
                 self.1 = Some(cx.waker().clone());
                 Poll::Pending
@@ -421,9 +393,9 @@ impl<T: Send + 'static> Stream for AsyncStdJoinSet<T> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct AsyncStdInstant(Instant);
+pub struct SmolInstant(Instant);
 
-impl InstantT for AsyncStdInstant {
+impl InstantT for SmolInstant {
     #[inline]
     fn elapsed(&self) -> Duration {
         self.0.elapsed()
@@ -432,9 +404,9 @@ impl InstantT for AsyncStdInstant {
 
 #[derive(Clone)]
 #[allow(unused)]
-struct AsyncStdMetricsCounter(&'static str);
+struct SmolMetricsCounter(&'static str);
 
-impl Counter for AsyncStdMetricsCounter {
+impl Counter for SmolMetricsCounter {
     #[cfg(feature = "metrics")]
     #[inline]
     fn increment(&mut self, value: usize) {
@@ -447,9 +419,9 @@ impl Counter for AsyncStdMetricsCounter {
 
 #[derive(Clone)]
 #[allow(unused)]
-struct AsyncStdMetricsGauge(&'static str);
+struct SmolMetricsGauge(&'static str);
 
-impl Gauge for AsyncStdMetricsGauge {
+impl Gauge for SmolMetricsGauge {
     #[cfg(feature = "metrics")]
     #[inline]
     fn increment(&mut self, value: usize) {
@@ -471,9 +443,9 @@ impl Gauge for AsyncStdMetricsGauge {
 
 #[derive(Clone)]
 #[allow(unused)]
-struct AsyncStdMetricsHistogram(&'static str);
+struct SmolMetricsHistogram(&'static str);
 
-impl Histogram for AsyncStdMetricsHistogram {
+impl Histogram for SmolMetricsHistogram {
     #[cfg(feature = "metrics")]
     #[inline]
     fn record(&mut self, record: f64) {
@@ -485,32 +457,32 @@ impl Histogram for AsyncStdMetricsHistogram {
 }
 
 #[derive(Clone)]
-pub struct AsyncStdMetricsHandle;
+pub struct SmolMetricsHandle;
 
-impl MetricsHandle for AsyncStdMetricsHandle {
+impl MetricsHandle for SmolMetricsHandle {
     #[inline]
     fn counter(&self, name: &'static str) -> impl Counter {
-        AsyncStdMetricsCounter(name)
+        SmolMetricsCounter(name)
     }
 
     #[inline]
     fn gauge(&self, name: &'static str) -> impl Gauge {
-        AsyncStdMetricsGauge(name)
+        SmolMetricsGauge(name)
     }
 
     #[inline]
     fn histogram(&self, name: &'static str) -> impl Histogram {
-        AsyncStdMetricsHistogram(name)
+        SmolMetricsHistogram(name)
     }
 }
 
 impl RuntimeT for Runtime {
-    type TcpStream = AsyncStdTcpStream;
-    type UdpSocket = AsyncStdUdpSocket;
-    type TcpListener = AsyncStdTcpListener;
-    type JoinSet<T: Send + 'static> = AsyncStdJoinSet<T>;
-    type MetricsHandle = AsyncStdMetricsHandle;
-    type Instant = AsyncStdInstant;
+    type TcpStream = SmolTcpStream;
+    type UdpSocket = SmolUdpSocket;
+    type TcpListener = SmolTcpListener;
+    type JoinSet<T: Send + 'static> = SmolJoinSet<T>;
+    type MetricsHandle = SmolMetricsHandle;
+    type Instant = SmolInstant;
     type Timer = Pin<Box<dyn Future<Output = ()> + Send>>;
 
     #[inline]
@@ -519,7 +491,7 @@ impl RuntimeT for Runtime {
         F: Future + Send + 'static,
         F::Output: Send,
     {
-        async_std::task::spawn(future);
+        smol::spawn(future).detach();
     }
 
     #[inline]
@@ -529,7 +501,7 @@ impl RuntimeT for Runtime {
 
     #[inline]
     fn now() -> Self::Instant {
-        AsyncStdInstant(Instant::now())
+        SmolInstant(Instant::now())
     }
 
     #[inline]
@@ -539,13 +511,13 @@ impl RuntimeT for Runtime {
 
     #[inline]
     fn join_set<T: Send + 'static>() -> Self::JoinSet<T> {
-        AsyncStdJoinSet(FuturesJoinSet::<T>::new(), None)
+        SmolJoinSet(FuturesJoinSet::<T>::new(), None)
     }
 
     #[cfg(feature = "metrics")]
     fn register_metrics(metrics: Vec<MetricType>, port: Option<u16>) -> Self::MetricsHandle {
         if metrics.is_empty() {
-            return AsyncStdMetricsHandle {};
+            return SmolMetricsHandle {};
         }
 
         let builder = PrometheusBuilder::new().with_http_listener(
@@ -577,22 +549,24 @@ impl RuntimeT for Runtime {
             .install()
             .expect("to succeed");
 
-        AsyncStdMetricsHandle {}
+        SmolMetricsHandle {}
     }
 
     #[cfg(not(feature = "metrics"))]
     fn register_metrics(_: Vec<MetricType>, _: Option<u16>) -> Self::MetricsHandle {
-        AsyncStdMetricsHandle {}
+        SmolMetricsHandle {}
     }
 
     #[inline]
     fn timer(duration: Duration) -> Self::Timer {
-        Box::pin(async_std::task::sleep(duration))
+        Box::pin(async move {
+            smol::Timer::after(duration).await;
+        })
     }
 
     #[inline]
     async fn delay(duration: Duration) {
-        async_std::task::sleep(duration).await
+        smol::Timer::after(duration).await;
     }
 
     fn gzip_compress(bytes: impl AsRef<[u8]>) -> Option<Vec<u8>> {
