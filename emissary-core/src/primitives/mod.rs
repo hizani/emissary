@@ -19,6 +19,7 @@
 use core::{fmt, ops::Deref};
 
 pub use capabilities::Capabilities;
+pub use datagram_flags::DatagramFlags;
 pub use date::Date;
 pub use destination::{Destination, DestinationId};
 pub use lease_set::{Lease, LeaseSet2, LeaseSet2Header};
@@ -33,6 +34,7 @@ pub use string::Str;
 pub use router_info::RouterInfoBuilder;
 
 mod capabilities;
+mod datagram_flags;
 mod date;
 mod destination;
 mod lease_set;

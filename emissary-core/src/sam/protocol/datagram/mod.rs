@@ -17,20 +17,20 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::{base64_encode, SigningPrivateKey, SigningPublicKey},
+    crypto::{base64_encode, sha256::Sha256, SigningPrivateKey, SigningPublicKey},
     error::Error,
     i2cp::I2cpPayload,
-    primitives::Destination,
+    primitives::{DatagramFlags, Destination, Mapping, OfflineSignature},
     protocol::Protocol,
     runtime::Runtime,
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use hashbrown::HashMap;
 use nom::bytes::complete::take;
 use thingbuf::mpsc::Sender;
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{borrow::Cow, format, string::String, vec::Vec};
 use core::marker::PhantomData;
 
 /// Logging target for the file.
@@ -43,6 +43,9 @@ pub struct DatagramManager<R: Runtime> {
 
     /// Local destination.
     destination: Destination,
+
+    /// Local destination SHA256 hash.
+    destination_hash: [u8; 32],
 
     /// Listeners.
     listeners: HashMap<u16, u16>,
@@ -63,6 +66,7 @@ impl<R: Runtime> DatagramManager<R> {
         signing_key: SigningPrivateKey,
     ) -> Self {
         Self {
+            destination_hash: Sha256::new().update(destination.as_ref()).finalize_new(),
             datagram_tx,
             destination,
             listeners: {
@@ -79,26 +83,66 @@ impl<R: Runtime> DatagramManager<R> {
         }
     }
 
+    /// Make anonymous datagram.
+    #[inline]
+    pub fn make_anonymous(&mut self, datagram: Vec<u8>) -> Bytes {
+        Bytes::from(datagram)
+    }
+
     /// Make repliable datagram.
-    ///
-    /// Caller must ensure to call this function with correct `protocol`.
-    pub fn make_datagram(&mut self, protocol: Protocol, datagram: Vec<u8>) -> Vec<u8> {
-        match protocol {
-            Protocol::Datagram => {
-                let signature = self.signing_key.sign(&datagram);
-                let destination = self.destination.serialize();
+    pub fn make_datagram(&mut self, datagram: Vec<u8>) -> Bytes {
+        let signature = self.signing_key.sign(&datagram);
 
-                let mut out =
-                    BytesMut::with_capacity(destination.len() + signature.len() + datagram.len());
-                out.put_slice(&destination);
-                out.put_slice(&signature);
-                out.put_slice(&datagram);
+        let mut out = BytesMut::with_capacity(
+            self.destination.serialized_len() + signature.len() + datagram.len(),
+        );
+        out.put_slice(&self.destination);
+        out.put_slice(&signature);
+        out.put_slice(&datagram);
 
-                out.to_vec()
-            }
-            Protocol::Anonymous => datagram,
-            Protocol::Streaming => unreachable!(),
-        }
+        out.freeze()
+    }
+
+    /// Make repliable datagram2.
+    pub fn make_datagram2(
+        &mut self,
+        payload: Vec<u8>,
+        destination_hash: &[u8],
+        options: Option<Mapping>,
+    ) -> Bytes {
+        // TODO datagram2: support sessions with offline_signature
+        let flags = DatagramFlags::new_v2(options, false).serialize();
+
+        let mut out = BytesMut::with_capacity(
+            self.destination.serialized_len()
+                + flags.len()
+                + payload.len()
+                + self.signing_key.signature_len(),
+        );
+
+        out.put_slice(&self.destination);
+
+        // start of signed data
+        let signed_data_start = out.len();
+
+        out.put_slice(destination_hash);
+        //TODO datagram2: write offsig data
+        //out.put_slice(&self.offsig_expiration_date);
+        //out.put_slice(&self.transient_key);
+        //out.put_slice(&self.offline_signature);
+        out.put_slice(&flags);
+        out.put_slice(&payload);
+        // end of signed data
+
+        let signature = self.signing_key.sign(&out[signed_data_start..]);
+
+        // remove destination hash from message
+        out.truncate(signed_data_start);
+        out.put_slice(&flags);
+        out.put_slice(&payload);
+        out.put_slice(&signature);
+
+        out.freeze()
     }
 
     /// Handle inbound datagram.
@@ -134,7 +178,7 @@ impl<R: Runtime> DatagramManager<R> {
 
                 let info = format!(
                     "{} FROM_PORT={src_port} TO_PORT={dst_port}\n",
-                    base64_encode(destination.serialize())
+                    base64_encode(destination.as_ref())
                 );
 
                 let info = info.as_bytes();
@@ -142,6 +186,68 @@ impl<R: Runtime> DatagramManager<R> {
                 let mut out = BytesMut::with_capacity(info.len() + rest.len());
                 out.put_slice(info);
                 out.put_slice(rest);
+
+                let _ = self.datagram_tx.try_send((*port, out.to_vec()));
+
+                Ok(())
+            }
+            Protocol::Datagram2 => {
+                let (rest, destination) =
+                    Destination::parse_frame(&payload).map_err(|_| Error::InvalidData)?;
+
+                let (rest, flags) =
+                    DatagramFlags::parse_frame(rest).map_err(|_| Error::InvalidData)?;
+
+                let (_options, has_offsig) = match flags {
+                    DatagramFlags::V2 {
+                        options,
+                        has_offsig,
+                    } => (options, has_offsig),
+                    _ => return Err(Error::InvalidData),
+                };
+
+                let (rest, verifying_key) = if has_offsig {
+                    let (rest, offsig) =
+                        OfflineSignature::parse_frame::<R>(rest, destination.verifying_key())
+                            .map_err(|_| Error::InvalidData)?;
+
+                    (rest, Cow::Owned(offsig))
+                } else {
+                    (rest, Cow::Borrowed(destination.verifying_key()))
+                };
+
+                // allocate enough memory to store signed data and final output.
+                let signed_data = &payload[self.destination.len()
+                    ..payload.len() - self.destination.len() - verifying_key.signature_len()];
+
+                // signed data = self destination hash + datagram2 content from flags to signature
+                let mut out =
+                    BytesMut::with_capacity(signed_data.len() + self.destination_hash.len());
+
+                out.put_slice(&self.destination_hash);
+                out.put_slice(signed_data);
+
+                // verify signature
+                let (signature, payload) =
+                    take::<_, _, ()>(rest.len() - verifying_key.signature_len())(rest)
+                        .map_err(|_| Error::InvalidData)?;
+
+                match verifying_key.as_ref() {
+                    SigningPublicKey::DsaSha1(_) => return Err(Error::NotSupported),
+                    verifying_key => verifying_key.verify(&out, signature)?,
+                }
+
+                out.clear();
+
+                let info = format!(
+                    "{} FROM_PORT={src_port} TO_PORT={dst_port}\n",
+                    base64_encode(destination.as_ref())
+                );
+
+                let info = info.as_bytes();
+
+                out.put_slice(info);
+                out.put_slice(payload);
 
                 let _ = self.datagram_tx.try_send((*port, out.to_vec()));
 

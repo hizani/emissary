@@ -17,12 +17,15 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::{base32_decode, base32_encode, base64_encode, SigningPrivateKey, StaticPrivateKey},
+    crypto::{
+        base32_decode, base32_encode, base64_encode, sha256::Sha256, SigningPrivateKey,
+        StaticPrivateKey,
+    },
     destination::{DeliveryStyle, Destination, DestinationEvent, LeaseSetStatus},
     error::QueryError,
     events::EventHandle,
     i2cp::{I2cpPayload, I2cpPayloadBuilder},
-    primitives::{Destination as Dest, DestinationId, LeaseSet2, LeaseSet2Header},
+    primitives::{Destination as Dest, DestinationId, LeaseSet2, LeaseSet2Header, Mapping},
     protocol::Protocol,
     runtime::{AddressBook, JoinSet, Runtime},
     sam::{
@@ -43,6 +46,7 @@ use hashbrown::HashMap;
 use thingbuf::mpsc::{Receiver, Sender};
 
 use alloc::{
+    boxed::Box,
     format,
     string::{String, ToString},
     sync::Arc,
@@ -80,7 +84,7 @@ pub enum SamSessionCommand<R: Runtime> {
     /// Open virtual stream to `destination` over this connection.
     Connect {
         /// SAMv3 socket associated with the outbound stream.
-        socket: SamSocket<R>,
+        socket: Box<SamSocket<R>>,
 
         /// Destination ID.
         destination_id: DestinationId,
@@ -95,7 +99,7 @@ pub enum SamSessionCommand<R: Runtime> {
     /// Accept inbond virtual stream over this connection.
     Accept {
         /// SAMv3 socket associated with the inbound stream.
-        socket: SamSocket<R>,
+        socket: Box<SamSocket<R>>,
 
         /// Options.
         options: HashMap<String, String>,
@@ -107,7 +111,7 @@ pub enum SamSessionCommand<R: Runtime> {
     /// Forward incoming virtual streams to a TCP listener listening to `port`.
     Forward {
         /// SAMv3 socket associated with forwarding.
-        socket: SamSocket<R>,
+        socket: Box<SamSocket<R>>,
 
         /// Port which the TCP listener is listening.
         port: u16,
@@ -122,13 +126,16 @@ pub enum SamSessionCommand<R: Runtime> {
     /// Send repliable datagram to remote destination.
     SendDatagram {
         /// Destination of the receiver.
-        destination: Dest,
+        destination: Box<Dest>,
 
         /// Datagram.
         datagram: Vec<u8>,
 
         /// Session ID.
         session_id: Arc<str>,
+
+        /// Options.
+        options: Option<Mapping>,
     },
 
     /// Dummy event, never constructed.
@@ -141,7 +148,7 @@ enum PendingSessionState<R: Runtime> {
     /// Awaiting lease set query result.
     AwaitingLeaseSet {
         /// SAMv3 client socket.
-        socket: SamSocket<R>,
+        socket: Box<SamSocket<R>>,
 
         /// Stream options.
         options: HashMap<String, String>,
@@ -183,7 +190,7 @@ pub struct PendingSession<R: Runtime> {
     /// Pending datagrams.
     ///
     /// Only set if there are pending datagrams for the remote destination.
-    datagrams: Option<(Dest, Vec<(Protocol, Vec<u8>)>)>,
+    datagrams: Option<(Dest, Vec<(Protocol, Vec<u8>, Option<Mapping>)>)>,
 }
 
 impl<R: Runtime> PendingSession<R> {
@@ -238,7 +245,10 @@ impl SamSessionKind {
             Self::Stream => false,
             Self::Datagram { .. } => true,
             Self::Primary { sub_sessions } => sub_sessions.get(session_id).is_some_and(|kind| {
-                core::matches!(kind, SessionKind::Datagram | SessionKind::Anonymous)
+                core::matches!(
+                    kind,
+                    SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2,
+                )
             }),
         }
     }
@@ -252,6 +262,7 @@ impl SamSessionKind {
             Self::Datagram { kind } => match kind {
                 SessionKind::Datagram => Protocol::Datagram,
                 SessionKind::Anonymous => Protocol::Anonymous,
+                SessionKind::Datagram2 => Protocol::Datagram2,
                 _ => unreachable!(),
             },
             Self::Primary { sub_sessions } => match sub_sessions.get(session_id).expect("to exist")
@@ -259,6 +270,7 @@ impl SamSessionKind {
                 SessionKind::Stream => Protocol::Streaming,
                 SessionKind::Datagram => Protocol::Datagram,
                 SessionKind::Anonymous => Protocol::Anonymous,
+                SessionKind::Datagram2 => Protocol::Datagram2,
                 _ => unreachable!(),
             },
         }
@@ -343,7 +355,7 @@ pub struct SamSession<R: Runtime> {
     /// Socket for reading session-related commands from the client.
     ///
     /// Set to `None` after the socket has been closed and th session is being destroyed.
-    socket: Option<SamSocket<R>>,
+    socket: Option<Box<SamSocket<R>>>,
 
     /// I2P virtual stream manager.
     stream_manager: StreamManager<R>,
@@ -498,6 +510,9 @@ impl<R: Runtime> SamSession<R> {
                 SessionKind::Anonymous => SamSessionKind::Datagram {
                     kind: SessionKind::Anonymous,
                 },
+                SessionKind::Datagram2 => SamSessionKind::Datagram {
+                    kind: SessionKind::Datagram2,
+                },
                 SessionKind::Primary => SamSessionKind::Primary {
                     sub_sessions: HashMap::new(),
                 },
@@ -517,7 +532,7 @@ impl<R: Runtime> SamSession<R> {
     fn create_outbound_stream(
         &mut self,
         destination_id: DestinationId,
-        socket: SamSocket<R>,
+        socket: Box<SamSocket<R>>,
         options: HashMap<String, String>,
     ) {
         let handle = self.destination.routing_path_handle(destination_id.clone());
@@ -573,7 +588,7 @@ impl<R: Runtime> SamSession<R> {
     /// Handle `STREAM CONNECT`.
     fn on_stream_connect(
         &mut self,
-        mut socket: SamSocket<R>,
+        mut socket: Box<SamSocket<R>>,
         destination_id: DestinationId,
         options: HashMap<String, String>,
         session_id: Arc<str>,
@@ -646,7 +661,7 @@ impl<R: Runtime> SamSession<R> {
     /// If the session wasn't configured to use streams, reject the accept request.
     fn on_stream_accept(
         &mut self,
-        socket: SamSocket<R>,
+        socket: Box<SamSocket<R>>,
         options: HashMap<String, String>,
         session_id: Arc<str>,
     ) {
@@ -684,7 +699,7 @@ impl<R: Runtime> SamSession<R> {
     /// If the session wasn't configured to use streams, reject the forward request.
     fn on_stream_forward(
         &mut self,
-        socket: SamSocket<R>,
+        socket: Box<SamSocket<R>>,
         port: u16,
         options: HashMap<String, String>,
         session_id: Arc<str>,
@@ -720,7 +735,13 @@ impl<R: Runtime> SamSession<R> {
     /// Send datagram to destination.
     ///
     /// If the session wasn't configured to use streams, the datagram is dropped.
-    fn on_send_datagram(&mut self, destination: Dest, datagram: Vec<u8>, session_id: Arc<str>) {
+    fn on_send_datagram(
+        &mut self,
+        destination: Dest,
+        datagram: Vec<u8>,
+        session_id: Arc<str>,
+        options: Option<Mapping>,
+    ) {
         if !self.session_kind.supports_datagrams(&session_id) {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -743,7 +764,16 @@ impl<R: Runtime> SamSession<R> {
 
         match self.destination.query_lease_set(&destination_id) {
             LeaseSetStatus::Found => {
-                let datagram = self.datagram_manager.make_datagram(protocol, datagram);
+                let datagram = match protocol {
+                    Protocol::Anonymous => self.datagram_manager.make_anonymous(datagram),
+                    Protocol::Datagram => self.datagram_manager.make_datagram(datagram),
+                    Protocol::Datagram2 => self.datagram_manager.make_datagram2(
+                        datagram,
+                        &Sha256::new().update(destination.as_ref()).finalize(),
+                        options,
+                    ),
+                    Protocol::Streaming => unreachable!(),
+                };
 
                 if let Some(message) =
                     I2cpPayloadBuilder::<R>::new(&datagram).with_protocol(protocol).build()
@@ -773,16 +803,16 @@ impl<R: Runtime> SamSession<R> {
                 match self.pending_outbound.get_mut(&destination_id) {
                     Some(PendingSession { datagrams, .. }) => match datagrams {
                         None => {
-                            *datagrams = Some((destination, vec![(protocol, datagram)]));
+                            *datagrams = Some((destination, vec![(protocol, datagram, options)]));
                         }
-                        Some((_, datagrams)) => datagrams.push((protocol, datagram)),
+                        Some((_, datagrams)) => datagrams.push((protocol, datagram, options)),
                     },
                     None => {
                         self.pending_outbound.insert(
                             destination_id,
                             PendingSession {
                                 streams: Vec::new(),
-                                datagrams: Some((destination, vec![(protocol, datagram)])),
+                                datagrams: Some((destination, vec![(protocol, datagram, options)])),
                             },
                         );
                     }
@@ -799,16 +829,16 @@ impl<R: Runtime> SamSession<R> {
                 match self.pending_outbound.get_mut(&destination_id) {
                     Some(PendingSession { datagrams, .. }) => match datagrams {
                         None => {
-                            *datagrams = Some((destination, vec![(protocol, datagram)]));
+                            *datagrams = Some((destination, vec![(protocol, datagram, options)]));
                         }
-                        Some((_, datagrams)) => datagrams.push((protocol, datagram)),
+                        Some((_, datagrams)) => datagrams.push((protocol, datagram, options)),
                     },
                     None => {
                         self.pending_outbound.insert(
                             destination_id,
                             PendingSession {
                                 streams: Vec::new(),
-                                datagrams: Some((destination, vec![(protocol, datagram)])),
+                                datagrams: Some((destination, vec![(protocol, datagram, options)])),
                             },
                         );
                     }
@@ -855,8 +885,17 @@ impl<R: Runtime> SamSession<R> {
             });
 
             if let Some((destination, datagrams)) = datagrams {
-                datagrams.into_iter().for_each(|(protocol, datagram)| {
-                    let datagram = self.datagram_manager.make_datagram(protocol, datagram);
+                datagrams.into_iter().for_each(|(protocol, datagram, options)| {
+                    let datagram = match protocol {
+                        Protocol::Anonymous => self.datagram_manager.make_anonymous(datagram),
+                        Protocol::Datagram => self.datagram_manager.make_datagram(datagram),
+                        Protocol::Datagram2 => self.datagram_manager.make_datagram2(
+                            datagram,
+                            &Sha256::new().update(destination.as_ref()).finalize(),
+                            options,
+                        ),
+                        Protocol::Streaming => unreachable!(),
+                    };
 
                     if let Some(message) =
                         I2cpPayloadBuilder::<R>::new(&datagram).with_protocol(protocol).build()
@@ -1295,7 +1334,10 @@ impl<R: Runtime> SamSession<R> {
         }
 
         // if session kind indicated datagrams, attempt to add listener into `DatagramManager`
-        if core::matches!(session_kind, SessionKind::Datagram | SessionKind::Anonymous) {
+        if core::matches!(
+            session_kind,
+            SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2
+        ) {
             if let Err(()) = self.datagram_manager.add_listener(options) {
                 return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"invalid datagram configuration\"\n".to_vec();
             }
@@ -1392,7 +1434,8 @@ impl<R: Runtime> Future for SamSession<R> {
                     destination,
                     datagram,
                     session_id,
-                })) => self.on_send_datagram(destination, datagram, session_id),
+                    options,
+                })) => self.on_send_datagram(*destination, datagram, session_id, options),
                 Poll::Ready(Some(SamSessionCommand::Dummy)) => unreachable!(),
             }
         }
@@ -1623,7 +1666,7 @@ mod tests {
 
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
 
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (client_socket, _) = stream2.unwrap();
 
         (
@@ -1975,7 +2018,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_connect(
@@ -2002,7 +2045,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_connect(
@@ -2026,7 +2069,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_connect(
@@ -2057,7 +2100,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_accept(socket, HashMap::new(), Arc::from("hello"));
@@ -2079,7 +2122,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_accept(socket, HashMap::new(), Arc::from("hello"));
@@ -2101,7 +2144,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_forward(socket, 8888, HashMap::new(), Arc::from("hello"));
@@ -2123,7 +2166,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_forward(socket, 8888, HashMap::new(), Arc::from("hello"));
@@ -2142,7 +2185,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_accept(socket, HashMap::new(), Arc::from("hello"));
@@ -2157,7 +2200,7 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_secs(1), future).await.is_ok());
 
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_forward(socket, 8888, HashMap::new(), Arc::from("hello"));
@@ -2179,7 +2222,7 @@ mod tests {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_forward(socket, address.port(), HashMap::new(), Arc::from("hello"));
@@ -2194,7 +2237,7 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_secs(1), future).await.is_ok());
 
         let (stream1, stream2) = tokio::join!(MockTcpStream::connect(address), listener.accept());
-        let socket = SamSocket::<MockRuntime>::new(stream1.unwrap());
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream1.unwrap()));
         let (mut client_socket, _) = stream2.unwrap();
 
         session.on_stream_accept(socket, HashMap::new(), Arc::from("hello"));
