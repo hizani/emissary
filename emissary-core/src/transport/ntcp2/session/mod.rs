@@ -38,9 +38,10 @@ use crate::{
     profile::ProfileStorage,
     router::context::RouterContext,
     runtime::{Runtime, TcpStream},
+    subsystem::SubsystemEvent,
     transport::{
         ntcp2::session::{initiator::Initiator, responder::Responder},
-        Direction, SubsystemHandle,
+        Direction,
     },
     util::{is_global, AsyncReadExt, AsyncWriteExt},
 };
@@ -49,6 +50,7 @@ use bytes::Bytes;
 
 use alloc::{vec, vec::Vec};
 use core::{future::Future, net::IpAddr, time::Duration};
+use thingbuf::mpsc::Sender;
 
 mod active;
 mod initiator;
@@ -123,8 +125,8 @@ pub struct SessionManager<R: Runtime> {
     /// Router context.
     router_ctx: RouterContext<R>,
 
-    /// Subsystem handle.
-    subsystem_handle: SubsystemHandle,
+    /// TX channel for sending events to `SubsystemManager`.
+    transport_tx: Sender<SubsystemEvent>,
 }
 
 impl<R: Runtime> SessionManager<R> {
@@ -139,8 +141,8 @@ impl<R: Runtime> SessionManager<R> {
         local_key: [u8; 32],
         local_iv: [u8; 16],
         router_ctx: RouterContext<R>,
-        subsystem_handle: SubsystemHandle,
         allow_local: bool,
+        transport_tx: Sender<SubsystemEvent>,
     ) -> Self {
         let local_key = StaticPrivateKey::from(local_key);
         let state = Sha256::new().update(PROTOCOL_NAME.as_bytes()).finalize_new();
@@ -159,7 +161,7 @@ impl<R: Runtime> SessionManager<R> {
             local_key,
             outbound_initial_state,
             router_ctx,
-            subsystem_handle,
+            transport_tx,
         }
     }
 
@@ -171,8 +173,8 @@ impl<R: Runtime> SessionManager<R> {
         local_key: StaticPrivateKey,
         noise_ctx: NoiseContext,
         allow_local: bool,
-        subsystem_handle: SubsystemHandle,
         event_handle: EventHandle<R>,
+        transport_tx: Sender<SubsystemEvent>,
     ) -> crate::Result<Ntcp2Session<R>> {
         let router_id = router.identity.id();
 
@@ -271,9 +273,9 @@ impl<R: Runtime> SessionManager<R> {
             router,
             stream,
             key_context,
-            subsystem_handle,
             Direction::Outbound,
             event_handle,
+            transport_tx,
         ))
     }
 
@@ -294,9 +296,9 @@ impl<R: Runtime> SessionManager<R> {
         let outbound_initial_state = self.outbound_initial_state;
         let chaining_key = self.chaining_key;
         let allow_local = self.allow_local;
-        let mut subsystem_handle = self.subsystem_handle.clone();
         let event_handle = self.router_ctx.event_handle().clone();
         let router_id = router.identity.id();
+        let transport_tx = self.transport_tx.clone();
 
         async move {
             match Self::create_session_inner(
@@ -306,8 +308,8 @@ impl<R: Runtime> SessionManager<R> {
                 local_key,
                 NoiseContext::new(chaining_key, outbound_initial_state),
                 allow_local,
-                subsystem_handle.clone(),
                 event_handle,
+                transport_tx.clone(),
             )
             .await
             {
@@ -319,7 +321,20 @@ impl<R: Runtime> SessionManager<R> {
                         ?error,
                         "failed to handshake with remote router",
                     );
-                    let _ = subsystem_handle.report_connection_failure(router_id.clone()).await;
+
+                    if let Err(error) = transport_tx
+                        .send(SubsystemEvent::ConnectionFailure {
+                            router_id: router_id.clone(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            %router_id,
+                            ?error,
+                            "failed to report connection failure to subsystem manager",
+                        );
+                    }
 
                     Err((Some(router_id), error))
                 }
@@ -333,11 +348,11 @@ impl<R: Runtime> SessionManager<R> {
         net_id: u8,
         local_router_hash: Vec<u8>,
         noise_ctx: NoiseContext,
-        subsystem_handle: SubsystemHandle,
         local_key: StaticPrivateKey,
         iv: [u8; 16],
         profile_storage: ProfileStorage<R>,
         event_handle: EventHandle<R>,
+        transport_tx: Sender<SubsystemEvent>,
     ) -> crate::Result<Ntcp2Session<R>> {
         tracing::trace!(
             target: LOG_TARGET,
@@ -389,9 +404,9 @@ impl<R: Runtime> SessionManager<R> {
                     router,
                     stream,
                     key_context,
-                    subsystem_handle,
                     Direction::Inbound,
                     event_handle,
+                    transport_tx,
                 ))
             }
             Err(error) => {
@@ -416,11 +431,11 @@ impl<R: Runtime> SessionManager<R> {
         let local_router_hash = self.router_ctx.router_id().to_vec();
         let inbound_initial_state = self.inbound_initial_state;
         let chaining_key = self.chaining_key;
-        let subsystem_handle = self.subsystem_handle.clone();
         let local_key = self.local_key.clone();
         let iv = self.local_iv;
         let profile_storage = self.router_ctx.profile_storage().clone();
         let event_handle = self.router_ctx.event_handle().clone();
+        let transport_tx = self.transport_tx.clone();
 
         async move {
             Self::accept_session_inner(
@@ -428,11 +443,11 @@ impl<R: Runtime> SessionManager<R> {
                 net_id,
                 local_router_hash,
                 NoiseContext::new(chaining_key, inbound_initial_state),
-                subsystem_handle,
                 local_key,
                 iv,
                 profile_storage,
                 event_handle,
+                transport_tx,
             )
             .await
             .map_err(|error| (None, error))
@@ -446,7 +461,7 @@ mod tests {
     use crate::{
         crypto::{SigningPrivateKey, StaticPrivateKey},
         events::EventManager,
-        i2np::{MessageBuilder, MessageType, I2NP_MESSAGE_EXPIRATION},
+        i2np::{Message, MessageType, I2NP_MESSAGE_EXPIRATION},
         primitives::{
             Capabilities, Date, Mapping, RouterAddress, RouterIdentity, RouterInfo, Str,
             TransportKind,
@@ -456,7 +471,7 @@ mod tests {
             mock::{MockRuntime, MockTcpListener, MockTcpStream},
             Runtime, TcpListener as _,
         },
-        subsystem::{InnerSubsystemEvent, SubsystemCommand, SubsystemHandle},
+        subsystem::OutboundMessage,
         transport::ntcp2::{listener::Ntcp2Listener, session::SessionManager},
     };
     use bytes::Bytes;
@@ -557,6 +572,7 @@ mod tests {
     #[tokio::test]
     async fn connection_succeeds() {
         let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None);
+        let (transport_tx1, _transport_rx1) = channel(16);
         let local = Ntcp2Builder::new().build();
         let local_manager = SessionManager::new(
             local.ntcp2_key,
@@ -571,14 +587,15 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx1,
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = Ntcp2Builder::new()
             .with_router_address(listener.local_addr().unwrap().port())
             .build();
+        let (transport_tx2, _transport_rx2) = channel(16);
         let remote_manager = SessionManager::new(
             remote.ntcp2_key,
             remote.ntcp2_iv,
@@ -592,8 +609,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx2,
         );
 
         let handle =
@@ -618,6 +635,7 @@ mod tests {
     async fn invalid_network_id_initiator() {
         let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None);
         let local = Ntcp2Builder::new().with_net_id(128).build();
+        let (transport_tx1, _transport_rx1) = channel(16);
         let local_manager = SessionManager::new(
             local.ntcp2_key,
             local.ntcp2_iv,
@@ -631,11 +649,12 @@ mod tests {
                 128,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx1,
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (transport_tx2, _transport_rx2) = channel(16);
         let remote = Ntcp2Builder::new()
             .with_router_address(listener.local_addr().unwrap().port())
             .build();
@@ -652,8 +671,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx2,
         );
 
         let handle = tokio::spawn(async move {
@@ -675,6 +694,7 @@ mod tests {
     async fn invalid_network_id_responder() {
         let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None);
         let local = Ntcp2Builder::new().build();
+        let (transport_tx1, _transport_rx1) = channel(16);
         let local_manager = SessionManager::new(
             local.ntcp2_key,
             local.ntcp2_iv,
@@ -688,8 +708,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx1,
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -697,6 +717,7 @@ mod tests {
             .with_net_id(128)
             .with_router_address(listener.local_addr().unwrap().port())
             .build();
+        let (transport_tx2, _transport_rx2) = channel(16);
         let remote_manager = SessionManager::new(
             remote.ntcp2_key,
             remote.ntcp2_iv,
@@ -710,8 +731,8 @@ mod tests {
                 128u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx2,
         );
 
         let handle = tokio::spawn(async move {
@@ -732,6 +753,7 @@ mod tests {
     #[tokio::test]
     async fn dialer_local_addresses_disabled() {
         let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None);
+        let (transport_tx1, _transport_rx1) = channel(16);
         let local = Ntcp2Builder::new().build();
         let local_manager = SessionManager::new(
             local.ntcp2_key,
@@ -746,8 +768,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             false,
+            transport_tx1,
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -755,6 +777,7 @@ mod tests {
             .with_net_id(128)
             .with_router_address(listener.local_addr().unwrap().port())
             .build();
+        let (transport_tx2, _transport_rx2) = channel(16);
         let remote_manager = SessionManager::new(
             remote.ntcp2_key,
             remote.ntcp2_iv,
@@ -768,8 +791,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx2,
         );
 
         tokio::spawn(async move {
@@ -789,6 +812,7 @@ mod tests {
     #[tokio::test]
     async fn listener_local_addresses_disabled() {
         let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None);
+        let (transport_tx1, _transport_rx1) = channel(16);
         let local = Ntcp2Builder::new().build();
         let local_manager = SessionManager::new(
             local.ntcp2_key,
@@ -803,8 +827,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx1,
         );
 
         let listener = MockTcpListener::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -822,15 +846,8 @@ mod tests {
     #[tokio::test]
     async fn received_expired_message() {
         let local = Ntcp2Builder::new().build();
-        let mut local_handle = SubsystemHandle::new();
         let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None);
-
-        let (_local_tunnel_tx, _local_tunnel_rx) = channel(64);
-        local_handle.register_subsystem(_local_tunnel_tx);
-
-        let (local_tx, local_rx) = channel(64);
-        local_handle.register_subsystem(local_tx);
-
+        let (local_tx, local_rx) = channel(16);
         let local_manager = SessionManager::new(
             local.ntcp2_key,
             local.ntcp2_iv,
@@ -844,22 +861,15 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            local_handle,
             true,
+            local_tx,
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = Ntcp2Builder::new()
             .with_router_address(listener.local_addr().unwrap().port())
             .build();
-
-        let mut remote_handle = SubsystemHandle::new();
-
-        let (_remote_tunnel_tx, _remote_tunnel_rx) = channel(64);
-        remote_handle.register_subsystem(_remote_tunnel_tx);
-
-        let (remote_tx, remote_rx) = channel(64);
-        remote_handle.register_subsystem(remote_tx);
+        let (remote_tx, remote_rx) = channel(16);
 
         let remote_manager = SessionManager::new(
             remote.ntcp2_key,
@@ -874,8 +884,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            remote_handle.clone(),
             true,
+            remote_tx,
         );
 
         let handle =
@@ -898,7 +908,8 @@ mod tests {
         let (_local_router, remote_command_tx) =
             tokio::time::timeout(Duration::from_secs(5), async {
                 match remote_rx.recv().await {
-                    Some(InnerSubsystemEvent::ConnectionEstablished { router, tx }) => (router, tx),
+                    Some(SubsystemEvent::ConnectionEstablished { router_id, tx }) =>
+                        (router_id, tx),
                     _ => panic!("invalid event received"),
                 }
             })
@@ -907,7 +918,8 @@ mod tests {
         let (_remote_router, _local_command_tx) =
             tokio::time::timeout(Duration::from_secs(5), async {
                 match local_rx.recv().await {
-                    Some(InnerSubsystemEvent::ConnectionEstablished { router, tx }) => (router, tx),
+                    Some(SubsystemEvent::ConnectionEstablished { router_id, tx }) =>
+                        (router_id, tx),
                     _ => panic!("invalid event received"),
                 }
             })
@@ -916,20 +928,18 @@ mod tests {
 
         // send non-expired database message
         remote_command_tx
-            .send(SubsystemCommand::SendMessage {
-                message: MessageBuilder::short()
-                    .with_expiration(MockRuntime::time_since_epoch() + I2NP_MESSAGE_EXPIRATION)
-                    .with_message_type(MessageType::DatabaseStore)
-                    .with_message_id(1337u32)
-                    .with_payload(&vec![1, 1, 1, 1])
-                    .build(),
-            })
+            .send(OutboundMessage::Message(Message {
+                expiration: MockRuntime::time_since_epoch() + I2NP_MESSAGE_EXPIRATION,
+                message_type: MessageType::DatabaseStore,
+                message_id: 1337u32,
+                payload: vec![1, 1, 1, 1],
+            }))
             .await
             .unwrap();
 
         tokio::time::timeout(Duration::from_secs(5), async {
             match local_rx.recv().await {
-                Some(InnerSubsystemEvent::I2Np { mut messages }) => {
+                Some(SubsystemEvent::Message { mut messages }) => {
                     assert_eq!(messages.len(), 1);
                     let (_, message) = messages.pop().unwrap();
 
@@ -945,14 +955,12 @@ mod tests {
 
         // send expired database message
         remote_command_tx
-            .send(SubsystemCommand::SendMessage {
-                message: MessageBuilder::short()
-                    .with_expiration(MockRuntime::time_since_epoch() - Duration::from_secs(5))
-                    .with_message_type(MessageType::DatabaseStore)
-                    .with_message_id(1338u32)
-                    .with_payload(&vec![2, 2, 2, 2])
-                    .build(),
-            })
+            .send(OutboundMessage::Message(Message {
+                expiration: MockRuntime::time_since_epoch() - Duration::from_secs(5),
+                message_type: MessageType::DatabaseStore,
+                message_id: 1338u32,
+                payload: vec![2, 2, 2, 2],
+            }))
             .await
             .unwrap();
 
@@ -967,20 +975,18 @@ mod tests {
 
         // send another non-expired database message
         remote_command_tx
-            .send(SubsystemCommand::SendMessage {
-                message: MessageBuilder::short()
-                    .with_expiration(MockRuntime::time_since_epoch() + I2NP_MESSAGE_EXPIRATION)
-                    .with_message_type(MessageType::DatabaseStore)
-                    .with_message_id(1339u32)
-                    .with_payload(&vec![3, 3, 3, 3])
-                    .build(),
-            })
+            .send(OutboundMessage::Message(Message {
+                expiration: MockRuntime::time_since_epoch() + I2NP_MESSAGE_EXPIRATION,
+                message_type: MessageType::DatabaseStore,
+                message_id: 1339u32,
+                payload: vec![3, 3, 3, 3],
+            }))
             .await
             .unwrap();
 
         tokio::time::timeout(Duration::from_secs(5), async {
             match local_rx.recv().await {
-                Some(InnerSubsystemEvent::I2Np { mut messages }) => {
+                Some(SubsystemEvent::Message { mut messages }) => {
                     assert_eq!(messages.len(), 1);
                     let (_, message) = messages.pop().unwrap();
 
@@ -999,6 +1005,7 @@ mod tests {
     async fn clock_skew_too_far_in_the_future() {
         let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (transport_tx1, _transport_rx1) = channel(16);
         let remote = Ntcp2Builder::new()
             .with_router_address(listener.local_addr().unwrap().port())
             .build();
@@ -1015,8 +1022,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx1,
         );
 
         let handle = std::thread::spawn(move || {
@@ -1029,6 +1036,7 @@ mod tests {
                         + 2 * MAX_CLOCK_SKEW,
                 ));
 
+                let (transport_tx1, _transport_rx1) = channel(16);
                 let local = Ntcp2Builder::new().build();
                 let local_manager = SessionManager::new(
                     local.ntcp2_key,
@@ -1043,8 +1051,8 @@ mod tests {
                         2u8,
                         event_handle.clone(),
                     ),
-                    SubsystemHandle::new(),
                     true,
+                    transport_tx1,
                 );
 
                 local_manager.create_session(remote.router_info.clone()).await
@@ -1068,6 +1076,7 @@ mod tests {
     async fn clock_skew_too_far_in_the_past() {
         let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (transport_tx1, _transport_rx1) = channel(16);
         let remote = Ntcp2Builder::new()
             .with_router_address(listener.local_addr().unwrap().port())
             .build();
@@ -1084,8 +1093,8 @@ mod tests {
                 2u8,
                 event_handle.clone(),
             ),
-            SubsystemHandle::new(),
             true,
+            transport_tx1,
         );
 
         let handle = std::thread::spawn(move || {
@@ -1098,6 +1107,7 @@ mod tests {
                         - 2 * MAX_CLOCK_SKEW,
                 ));
 
+                let (transport_tx1, _transport_rx1) = channel(16);
                 let local = Ntcp2Builder::new().build();
                 let local_manager = SessionManager::new(
                     local.ntcp2_key,
@@ -1112,8 +1122,8 @@ mod tests {
                         2u8,
                         event_handle.clone(),
                     ),
-                    SubsystemHandle::new(),
                     true,
+                    transport_tx1,
                 );
 
                 local_manager.create_session(remote.router_info.clone()).await

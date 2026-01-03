@@ -24,7 +24,7 @@ use crate::{
     error::Ssu2Error,
     primitives::RouterId,
     runtime::Runtime,
-    subsystem::SubsystemHandle,
+    subsystem::SubsystemEvent,
     transport::ssu2::{
         message::{
             handshake::{SessionConfirmedBuilder, SessionRequestBuilder, TokenRequestBuilder},
@@ -101,8 +101,8 @@ pub struct OutboundSsu2Context {
     /// Remote router's static key.
     pub static_key: StaticPublicKey,
 
-    /// Subsystem handle.
-    pub subsystem_handle: SubsystemHandle,
+    /// TX channel for communicating with `SubsystemManager`.
+    pub transport_tx: Sender<SubsystemEvent>,
 }
 
 /// State for a pending outbound SSU2 session.
@@ -195,8 +195,8 @@ pub struct OutboundSsu2Session<R: Runtime> {
     /// Pending session state.
     state: PendingSessionState,
 
-    /// Subsystem handle.
-    subsystem_handle: SubsystemHandle,
+    /// TX channel for communicating with `SubsystemManager`.
+    transport_tx: Sender<SubsystemEvent>,
 }
 
 impl<R: Runtime> OutboundSsu2Session<R> {
@@ -217,7 +217,7 @@ impl<R: Runtime> OutboundSsu2Session<R> {
             src_id,
             state,
             static_key,
-            subsystem_handle,
+            transport_tx,
         } = context;
 
         tracing::trace!(
@@ -269,7 +269,7 @@ impl<R: Runtime> OutboundSsu2Session<R> {
                 router_info,
                 static_key,
             },
-            subsystem_handle,
+            transport_tx,
         }
     }
 
@@ -661,7 +661,20 @@ impl<R: Runtime> OutboundSsu2Session<R> {
                 | PendingSsu2SessionStatus::Timeout { .. }
                 | PendingSsu2SessionStatus::SocketClosed { .. }
         ) {
-            self.subsystem_handle.report_connection_failure(self.router_id.clone()).await;
+            if let Err(error) = self
+                .transport_tx
+                .send(SubsystemEvent::ConnectionFailure {
+                    router_id: self.router_id.clone(),
+                })
+                .await
+            {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    router_id = %self.router_id,
+                    ?error,
+                    "failed to report connection failure to subsystem manager",
+                );
+            }
         }
 
         status
@@ -752,7 +765,6 @@ mod tests {
         crypto::sha256::Sha256,
         primitives::RouterInfoBuilder,
         runtime::mock::MockRuntime,
-        subsystem::InnerSubsystemEvent,
         transport::ssu2::session::pending::inbound::{InboundSsu2Context, InboundSsu2Session},
     };
     use rand_core::RngCore;
@@ -769,10 +781,10 @@ mod tests {
     }
 
     struct OutboundContext {
-        event_rx: Receiver<InnerSubsystemEvent>,
         outbound_session: OutboundSsu2Session<MockRuntime>,
         outbound_session_tx: Sender<Packet>,
         outbound_socket_rx: Receiver<Packet>,
+        transport_rx: Receiver<SubsystemEvent>,
     }
 
     fn create_session() -> (InboundContext, OutboundContext) {
@@ -809,13 +821,7 @@ mod tests {
         let (inbound_session_tx, inbound_session_rx) = channel(128);
         let (outbound_socket_tx, outbound_socket_rx) = channel(128);
         let (outbound_session_tx, outbound_session_rx) = channel(128);
-        let (event_rx, subsystem_handle) = {
-            let (event_tx, event_rx) = channel(128);
-            let mut handle = SubsystemHandle::new();
-            handle.register_subsystem(event_tx);
-
-            (event_rx, handle)
-        };
+        let (transport_tx, transport_rx) = channel(128);
 
         let (router_info, _, signing_key) = RouterInfoBuilder::default()
             .with_ssu2(crate::Ssu2Config {
@@ -843,7 +849,7 @@ mod tests {
             src_id,
             state: inbound_state.clone(),
             static_key: inbound_static_key.public(),
-            subsystem_handle,
+            transport_tx,
         });
 
         let (pkt, pkt_num, dst_id, src_id) = {
@@ -882,7 +888,7 @@ mod tests {
                 inbound_session: inbound,
             },
             OutboundContext {
-                event_rx,
+                transport_rx,
                 outbound_session: outbound,
                 outbound_session_tx,
                 outbound_socket_rx,
@@ -895,10 +901,10 @@ mod tests {
         let (
             InboundContext { .. },
             OutboundContext {
-                event_rx,
                 outbound_session,
                 outbound_session_tx: _ob_sess_tx,
                 outbound_socket_rx,
+                transport_rx,
             },
         ) = create_session();
         let router_id = outbound_session.router_id.clone();
@@ -919,12 +925,14 @@ mod tests {
             _ => panic!("invalid result"),
         }
 
-        match tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        match tokio::time::timeout(Duration::from_secs(5), transport_rx.recv())
             .await
             .expect("no timeout")
             .expect("to succeed")
         {
-            InnerSubsystemEvent::ConnectionFailure { router } => assert_eq!(router, router_id),
+            SubsystemEvent::ConnectionFailure { router_id: router } => {
+                assert_eq!(router, router_id)
+            }
             _ => panic!("invalid event"),
         }
     }
@@ -938,10 +946,10 @@ mod tests {
                 inbound_session_tx: _ib_sess_tx,
             },
             OutboundContext {
-                event_rx,
                 outbound_session,
                 outbound_session_tx: ob_sess_tx,
                 outbound_socket_rx,
+                transport_rx,
             },
         ) = create_session();
 
@@ -973,12 +981,14 @@ mod tests {
             _ => panic!("invalid result"),
         }
 
-        match tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        match tokio::time::timeout(Duration::from_secs(5), transport_rx.recv())
             .await
             .expect("no timeout")
             .expect("to succeed")
         {
-            InnerSubsystemEvent::ConnectionFailure { router } => assert_eq!(router, router_id),
+            SubsystemEvent::ConnectionFailure { router_id: router } => {
+                assert_eq!(router, router_id)
+            }
             _ => panic!("invalid event"),
         }
     }
@@ -992,10 +1002,10 @@ mod tests {
                 inbound_session_tx: ib_sess_tx,
             },
             OutboundContext {
-                event_rx,
                 outbound_session,
                 outbound_session_tx: ob_sess_tx,
                 outbound_socket_rx,
+                transport_rx,
             },
         ) = create_session();
 
@@ -1045,12 +1055,14 @@ mod tests {
             _ => panic!("invalid result"),
         }
 
-        match tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        match tokio::time::timeout(Duration::from_secs(5), transport_rx.recv())
             .await
             .expect("no timeout")
             .expect("to succeed")
         {
-            InnerSubsystemEvent::ConnectionFailure { router } => assert_eq!(router, router_id),
+            SubsystemEvent::ConnectionFailure { router_id: router } => {
+                assert_eq!(router, router_id)
+            }
             _ => panic!("invalid event"),
         }
     }
@@ -1064,10 +1076,10 @@ mod tests {
                 inbound_session_tx: ib_sess_tx,
             },
             OutboundContext {
-                event_rx: _event_rx,
                 mut outbound_session,
                 outbound_session_tx: ob_sess_tx,
                 outbound_socket_rx,
+                transport_rx: _transport_rx,
             },
         ) = create_session();
 
