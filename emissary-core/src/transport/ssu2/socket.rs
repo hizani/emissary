@@ -21,7 +21,7 @@ use crate::{
     error::{ChannelError, Ssu2Error},
     primitives::{RouterId, RouterInfo, TransportKind},
     router::context::RouterContext,
-    runtime::{Counter, Gauge, Histogram, JoinSet, MetricsHandle, Runtime},
+    runtime::{Counter, Gauge, Histogram, JoinSet, MetricsHandle, Runtime, UdpSocket},
     subsystem::SubsystemEvent,
     transport::{
         ssu2::{
@@ -40,16 +40,15 @@ use crate::{
         },
         Direction, TerminationReason, TransportEvent,
     },
-    util::udp::{UdpSocket, UdpSocketHandle},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use hashbrown::HashMap;
 use rand_core::RngCore;
-use thingbuf::mpsc::{channel, errors::TrySendError, Receiver, Sender};
+use thingbuf::mpsc::{channel, errors::TrySendError, Sender};
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, vec, vec::Vec};
 use core::{
     fmt, mem,
     net::SocketAddr,
@@ -68,10 +67,8 @@ const PROTOCOL_NAME: &str = "Noise_XKchaobfse+hs1+hs2+hs3_25519_ChaChaPoly_SHA25
 /// This is the channel from [`Ssu2Socket`] to a pending/active SSU2 session.
 const CHANNEL_SIZE: usize = 256usize;
 
-/// SSU2 packet channel size.
-///
-/// Used to receive datagrams from active sessions.
-const PKT_CHANNEL_SIZE: usize = 8192usize;
+/// Maximum datagram size.
+const DATAGRAM_MAX_SIZE: usize = 0xfff;
 
 /// Pending session kind.
 enum PendingSessionKind {
@@ -164,7 +161,7 @@ pub struct Ssu2Socket<R: Runtime> {
     /// Active sessions.
     ///
     /// The session returns a `(RouterId, destination connection ID)` tuple when it exits.
-    active_sessions: R::JoinSet<TerminationContext>,
+    active_sessions: R::JoinSet<TerminationContext<R>>,
 
     /// Chaining key.
     chaining_key: Bytes,
@@ -189,11 +186,8 @@ pub struct Ssu2Socket<R: Runtime> {
     /// Pending SSU2 sessions.
     pending_sessions: R::JoinSet<PendingSsu2SessionStatus<R>>,
 
-    /// RX channel for receiving packets from active sessions.
-    pkt_rx: Receiver<Packet>,
-
-    /// TX channel given to active sessions.
-    pkt_tx: Sender<Packet>,
+    /// Datagram read buffer.
+    read_buffer: Vec<u8>,
 
     /// Router context.
     router_ctx: RouterContext<R>,
@@ -201,8 +195,8 @@ pub struct Ssu2Socket<R: Runtime> {
     /// SSU2 sessions.
     sessions: HashMap<u64, Sender<Packet>>,
 
-    /// UDP socket handle.
-    socket_handle: UdpSocketHandle,
+    /// UDP socket.
+    socket: R::UdpSocket,
 
     /// Static key.
     static_key: StaticPrivateKey,
@@ -241,15 +235,6 @@ impl<R: Runtime> Ssu2Socket<R> {
             .update(static_key.public().to_vec())
             .finalize();
 
-        // create channel pair which is used to exchange outbound packets
-        // with active sessions and `Ssu2Socket`
-        //
-        // TODO: implement `Clone` for `R::UdpSocket`
-        let (pkt_tx, pkt_rx) = channel(PKT_CHANNEL_SIZE);
-
-        let (socket, socket_handle) = UdpSocket::<R>::new(socket);
-        R::spawn(socket.run());
-
         Self {
             active_sessions: R::join_set(),
             chaining_key: Bytes::from(chaining_key),
@@ -259,11 +244,10 @@ impl<R: Runtime> Ssu2Socket<R> {
             pending_outbound: HashMap::new(),
             pending_pkts: VecDeque::new(),
             pending_sessions: R::join_set(),
-            pkt_rx,
-            pkt_tx,
+            read_buffer: vec![0u8; DATAGRAM_MAX_SIZE],
             router_ctx,
             sessions: HashMap::new(),
-            socket_handle,
+            socket,
             static_key,
             terminating_session: R::join_set(),
             transport_tx,
@@ -329,17 +313,17 @@ impl<R: Runtime> Ssu2Socket<R> {
                     dst_id: connection_id,
                     intro_key: self.intro_key,
                     net_id: self.router_ctx.net_id(),
-                    pkt_num,
                     pkt: datagram,
-                    pkt_tx: self.pkt_tx.clone(),
+                    pkt_num,
                     rx,
+                    socket: self.socket.clone(),
                     src_id,
                     state: self.inbound_state.clone(),
                     static_key: self.static_key.clone(),
                 })?;
 
                 self.sessions.insert(connection_id, tx);
-                self.pending_sessions.push(session);
+                self.pending_sessions.push(session.run());
                 self.router_ctx.metrics_handle().counter(NUM_INBOUND_SSU2).increment(1);
 
                 Ok(())
@@ -415,11 +399,11 @@ impl<R: Runtime> Ssu2Socket<R> {
                 local_intro_key: self.intro_key,
                 local_static_key: self.static_key.clone(),
                 net_id: self.router_ctx.net_id(),
-                pkt_tx: self.pkt_tx.clone(),
                 remote_intro_key: intro_key,
                 router_id,
                 router_info,
                 rx,
+                socket: self.socket.clone(),
                 src_id,
                 state,
                 static_key,
@@ -485,7 +469,7 @@ impl<R: Runtime> Ssu2Socket<R> {
         self.active_sessions.push(
             Ssu2Session::<R>::new(
                 context,
-                self.pkt_tx.clone(),
+                self.socket.clone(),
                 self.transport_tx.clone(),
                 self.router_ctx.metrics_handle().clone(),
             )
@@ -538,14 +522,14 @@ impl<R: Runtime> Ssu2Socket<R> {
                         address,
                         dst_id,
                         intro_key,
+                        k_session_confirmed: Some(k_header_2),
                         next_pkt_num: 0,
                         reason: TerminationReason::ConnectionLimits,
                         recv_key_ctx,
                         router_id,
                         rx: pkt_rx,
                         send_key_ctx,
-                        tx: self.pkt_tx.clone(),
-                        k_session_confirmed: Some(k_header_2),
+                        socket: self.socket.clone(),
                     },
                 ))
             }
@@ -577,7 +561,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
         let this = &mut *self;
 
         loop {
-            match this.socket_handle.poll_next_unpin(cx) {
+            match Pin::new(&mut this.socket).poll_recv_from(cx, &mut this.read_buffer) {
                 Poll::Pending => break,
                 Poll::Ready(None) => {
                     tracing::warn!(
@@ -586,18 +570,15 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                     );
                     return Poll::Ready(None);
                 }
-                Poll::Ready(Some((datagram, from))) => {
-                    this.router_ctx
-                        .metrics_handle()
-                        .counter(INBOUND_BANDWIDTH)
-                        .increment(datagram.len());
+                Poll::Ready(Some((nread, from))) => {
+                    this.router_ctx.metrics_handle().counter(INBOUND_BANDWIDTH).increment(nread);
                     this.router_ctx.metrics_handle().counter(INBOUND_PKT_COUNT).increment(1);
                     this.router_ctx
                         .metrics_handle()
                         .histogram(INBOUND_PKT_SIZES)
-                        .record(datagram.len() as f64);
+                        .record(nread as f64);
 
-                    match this.handle_packet(datagram, from) {
+                    match this.handle_packet(this.read_buffer[..nread].to_vec(), from) {
                         Err(Ssu2Error::Channel(ChannelError::Full)) => {
                             tracing::debug!(
                                 target: LOG_TARGET,
@@ -605,7 +586,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                             );
                             this.router_ctx
                                 .metrics_handle()
-                                .counter(NUM_DROPS_CHANNEL_FULL)
+                                .counter(NUM_DROPPED_DATAGRAMS)
                                 .increment(1);
                         }
                         Err(error) => tracing::debug!(
@@ -843,16 +824,6 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
         }
 
         loop {
-            match this.pkt_rx.poll_recv(cx) {
-                Poll::Pending => break,
-                Poll::Ready(None) => return Poll::Ready(None),
-                // TODO: useless conversion from vec to bytesmut
-                Poll::Ready(Some(Packet { pkt, address })) =>
-                    this.pending_pkts.push_back((BytesMut::from(&pkt[..]), address)),
-            }
-        }
-
-        loop {
             match mem::replace(&mut this.write_state, WriteState::Poisoned) {
                 WriteState::GetPacket => match this.pending_pkts.pop_front() {
                     None => {
@@ -863,26 +834,24 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                         this.write_state = WriteState::SendPacket { pkt, target };
                     }
                 },
-                WriteState::SendPacket { pkt, target } => {
-                    let nwritten = pkt.len();
+                WriteState::SendPacket { pkt, target } => match Pin::new(&mut this.socket)
+                    .poll_send_to(cx, &pkt, target)
+                {
+                    Poll::Ready(Some(nwritten)) => {
+                        this.router_ctx
+                            .metrics_handle()
+                            .counter(OUTBOUND_BANDWIDTH)
+                            .increment(nwritten);
+                        this.router_ctx.metrics_handle().counter(OUTBOUND_PKT_COUNT).increment(1);
 
-                    match this.socket_handle.try_send_to(pkt.to_vec(), target) {
-                        Ok(()) => {
-                            this.router_ctx
-                                .metrics_handle()
-                                .counter(OUTBOUND_BANDWIDTH)
-                                .increment(nwritten);
-                            this.router_ctx
-                                .metrics_handle()
-                                .counter(OUTBOUND_PKT_COUNT)
-                                .increment(1);
-
-                            this.write_state = WriteState::GetPacket;
-                        }
-                        Err(ChannelError::Closed) => return Poll::Ready(None),
-                        Err(ChannelError::DoesntExist | ChannelError::Full) => {}
+                        this.write_state = WriteState::GetPacket;
                     }
-                }
+                    Poll::Ready(None) => return Poll::Ready(None),
+                    Poll::Pending => {
+                        this.write_state = WriteState::SendPacket { pkt, target };
+                        break;
+                    }
+                },
                 WriteState::Poisoned => unreachable!(),
             }
         }
@@ -933,10 +902,17 @@ mod tests {
             transport_tx,
             router_ctx,
         );
+        let udp_socket = <MockRuntime as Runtime>::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut recv_socket =
+            <MockRuntime as Runtime>::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
 
         let (_pkt_tx, pkt_rx) = channel(128);
         let context = Ssu2SessionContext {
-            address: "127.0.0.1:8888".parse().unwrap(),
+            address: recv_socket.local_address().unwrap(),
             dst_id: 1337u64,
             intro_key: [0xbb; 32],
             pkt_rx,
@@ -953,7 +929,7 @@ mod tests {
         socket.active_sessions.push(
             Ssu2Session::<MockRuntime>::new(
                 context,
-                socket.pkt_tx.clone(),
+                udp_socket,
                 socket.transport_tx.clone(),
                 socket.router_ctx.metrics_handle().clone(),
             )
@@ -981,7 +957,8 @@ mod tests {
         .unwrap();
 
         // verify the message is received by `Ssu2Socket`
-        let _pkt = tokio::time::timeout(Duration::from_secs(5), socket.pkt_rx.recv())
+        let mut buffer = vec![0u8; 0xffff];
+        let _ = tokio::time::timeout(Duration::from_secs(5), recv_socket.recv_from(&mut buffer))
             .await
             .unwrap()
             .unwrap();
