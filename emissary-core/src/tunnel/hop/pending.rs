@@ -153,15 +153,6 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
             (_, _) => unreachable!(),
         };
 
-        tracing::trace!(
-            target: LOG_TARGET,
-            direction = ?T::direction(),
-            %message_id,
-            %tunnel_id,
-            num_hops = ?hops.len(),
-            "create tunnel",
-        );
-
         // set build record to expire 10 seconds from now
         let time_now = R::time_since_epoch();
         let build_expiration = time_now + TUNNEL_BUILD_EXPIRATION;
@@ -222,6 +213,23 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
             .map(|(router_hash, _)| (TunnelId::from(R::rng().next_u32()), router_hash.clone()))
             .chain(iter::once((gateway, router_id.clone())))
             .unzip();
+        let hop_info = tunnel_ids
+            .iter()
+            .zip(router_hashes.iter())
+            .map(|(tunnel_id, router_id)| {
+                alloc::format!("({tunnel_id}, {})", RouterId::from(router_id))
+            })
+            .collect::<Vec<_>>();
+
+        tracing::trace!(
+            target: LOG_TARGET,
+            direction = ?T::direction(),
+            %message_id,
+            %tunnel_id,
+            hops = ?hop_info,
+            num_hops = ?hops.len(),
+            "create tunnel",
+        );
 
         // create build records and generate key contexts for each hop
         let (mut tunnel_hops, mut build_records): (VecDeque<TunnelHop>, Vec<Vec<u8>>) = tunnel_ids
