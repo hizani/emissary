@@ -19,7 +19,7 @@
 use crate::{
     crypto::{
         chachapoly::ChaChaPoly, hmac::Hmac, noise::NoiseContext, EphemeralPrivateKey,
-        StaticPrivateKey, StaticPublicKey,
+        SigningPublicKey, StaticPrivateKey, StaticPublicKey,
     },
     error::Ssu2Error,
     primitives::RouterId,
@@ -94,6 +94,9 @@ pub struct OutboundSsu2Context<R: Runtime> {
     /// RX channel for receiving datagrams from `Ssu2Socket`.
     pub rx: Receiver<Packet>,
 
+    /// Verifying key of remote router.
+    pub verifying_key: SigningPublicKey,
+
     /// UDP socket.
     pub socket: R::UdpSocket,
 
@@ -167,6 +170,11 @@ pub struct OutboundSsu2Session<R: Runtime> {
     /// Destination connection ID.
     dst_id: u64,
 
+    /// Our external address.
+    ///
+    /// Received in a `Retry` message.
+    external_address: Option<SocketAddr>,
+
     /// Local router intro key.
     local_intro_key: [u8; 32],
 
@@ -179,12 +187,6 @@ pub struct OutboundSsu2Session<R: Runtime> {
     /// Packet retransmitter.
     pkt_retransmitter: PacketRetransmitter<R>,
 
-    /// UDP socket.
-    socket: R::UdpSocket,
-
-    /// Write buffer.
-    write_buffer: VecDeque<Vec<u8>>,
-
     /// Remote router intro key.
     remote_intro_key: [u8; 32],
 
@@ -193,6 +195,9 @@ pub struct OutboundSsu2Session<R: Runtime> {
 
     /// RX channel for receiving datagrams from `Ssu2Socket`.
     rx: Option<Receiver<Packet>>,
+
+    /// UDP socket.
+    socket: R::UdpSocket,
 
     /// Source connection ID.
     src_id: u64,
@@ -205,6 +210,12 @@ pub struct OutboundSsu2Session<R: Runtime> {
 
     /// TX channel for communicating with `SubsystemManager`.
     transport_tx: Sender<SubsystemEvent>,
+
+    /// Verifying key of remote router.
+    verifying_key: SigningPublicKey,
+
+    /// Write buffer.
+    write_buffer: VecDeque<Vec<u8>>,
 }
 
 impl<R: Runtime> OutboundSsu2Session<R> {
@@ -221,6 +232,7 @@ impl<R: Runtime> OutboundSsu2Session<R> {
             router_id,
             router_info,
             rx,
+            verifying_key,
             socket,
             src_id,
             state,
@@ -243,9 +255,11 @@ impl<R: Runtime> OutboundSsu2Session<R> {
             .with_net_id(net_id)
             .build::<R>()
             .to_vec();
+
         Self {
             address,
             dst_id,
+            external_address: None,
             local_intro_key,
             net_id,
             noise_ctx: NoiseContext::new(
@@ -256,6 +270,7 @@ impl<R: Runtime> OutboundSsu2Session<R> {
             remote_intro_key,
             router_id,
             rx: Some(rx),
+            verifying_key,
             socket,
             src_id,
             started: R::now(),
@@ -355,6 +370,28 @@ impl<R: Runtime> OutboundSsu2Session<R> {
             return Err(Ssu2Error::SessionTerminated(TerminationReason::ssu2(
                 *reason,
             )));
+        }
+
+        match blocks.iter().find(|block| core::matches!(block, Block::Address { .. })) {
+            Some(Block::Address { address }) => {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    router_id = %self.router_id,
+                    dst_id = ?self.dst_id,
+                    src_id = ?self.src_id,
+                    ?address,
+                    "external address discovered",
+                );
+
+                self.external_address = Some(*address);
+            }
+            Some(_) => {}
+            None => tracing::warn!(
+                router_id = %self.router_id,
+                dst_id = ?self.dst_id,
+                src_id = ?self.src_id,
+                "Retry does not contain an address block",
+            ),
         }
 
         // MixKey(DH())
@@ -631,11 +668,13 @@ impl<R: Runtime> OutboundSsu2Session<R> {
                 address: self.address,
                 dst_id: self.dst_id,
                 intro_key: self.remote_intro_key,
-                recv_key_ctx: KeyContext::new(k_data_ba, k_header_2_ba),
-                send_key_ctx: KeyContext::new(k_data_ab, k_header_2_ab),
-                router_id: self.router_id.clone(),
                 pkt_rx: self.rx.take().expect("to exist"),
+                recv_key_ctx: KeyContext::new(k_data_ba, k_header_2_ba),
+                router_id: self.router_id.clone(),
+                send_key_ctx: KeyContext::new(k_data_ab, k_header_2_ab),
+                verifying_key: self.verifying_key.clone(),
             },
+            external_address: self.external_address,
             src_id: self.src_id,
             started: self.started,
         }))
@@ -897,14 +936,15 @@ mod tests {
             address: inbound_address,
             chaining_key: Bytes::from(chaining_key.clone()),
             dst_id,
-            remote_intro_key: inbound_intro_key,
             local_intro_key: outbound_intro_key,
             local_static_key: outbound_static_key,
             net_id: 2u8,
-            socket: outbound_socket.clone(),
+            remote_intro_key: inbound_intro_key,
             router_id: router_info.identity.id(),
             router_info: Bytes::from(router_info.serialize(&signing_key)),
             rx: outbound_session_rx,
+            verifying_key: signing_key.public(),
+            socket: outbound_socket.clone(),
             src_id,
             state: inbound_state.clone(),
             static_key: inbound_static_key.public(),

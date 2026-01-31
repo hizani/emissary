@@ -558,8 +558,10 @@ impl<R: Runtime> InboundSsu2Session<R> {
             Ssu2Error::Malformed
         })?;
 
-        let Some(Block::RouterInfo { router_info }) =
-            blocks.iter().find(|block| core::matches!(block, Block::RouterInfo { .. }))
+        let Some(Block::RouterInfo {
+            router_info,
+            serialized,
+        }) = blocks.into_iter().find(|block| core::matches!(block, Block::RouterInfo { .. }))
         else {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -577,6 +579,7 @@ impl<R: Runtime> InboundSsu2Session<R> {
             debug_assert!(false);
             return Err(Ssu2Error::Malformed);
         };
+        let verifying_key = router_info.identity.signing_key().clone();
         let temp_key = Hmac::new(self.noise_ctx.chaining_key()).update([]).finalize();
         let k_ab = Hmac::new(&temp_key).update([0x01]).finalize();
         let k_ba = Hmac::new(&temp_key).update(&k_ab).update([0x02]).finalize();
@@ -617,16 +620,19 @@ impl<R: Runtime> InboundSsu2Session<R> {
                 address: self.address,
                 dst_id: self.src_id,
                 intro_key,
-                recv_key_ctx: KeyContext::new(k_data_ab, k_header_2_ab),
-                send_key_ctx: KeyContext::new(k_data_ba, k_header_2_ba),
-                router_id: router_info.identity.id(),
                 pkt_rx: self.rx.take().expect("to exist"),
+                recv_key_ctx: KeyContext::new(k_data_ab, k_header_2_ab),
+                router_id: router_info.identity.id(),
+                send_key_ctx: KeyContext::new(k_data_ba, k_header_2_ba),
+                verifying_key,
             },
             dst_id: self.dst_id,
+            k_header_2,
             pkt,
+            router_info,
+            serialized,
             started: self.started,
             target: self.address,
-            k_header_2,
         }))
     }
 
@@ -922,14 +928,15 @@ mod tests {
             address: inbound_address,
             chaining_key: Bytes::from(chaining_key.clone()),
             dst_id,
-            remote_intro_key: inbound_intro_key,
             local_intro_key: outbound_intro_key,
-            net_id: 2u8,
             local_static_key: outbound_static_key,
-            socket: outbound_socket.clone(),
+            net_id: 2u8,
+            remote_intro_key: inbound_intro_key,
             router_id: router_info.identity.id(),
             router_info: Bytes::from(router_info.serialize(&signing_key)),
             rx: outbound_session_rx,
+            verifying_key: signing_key.public(),
+            socket: outbound_socket.clone(),
             src_id,
             state: inbound_state.clone(),
             static_key: inbound_static_key.public(),

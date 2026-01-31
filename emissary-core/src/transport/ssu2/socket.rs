@@ -27,6 +27,7 @@ use crate::{
         ssu2::{
             message::{HeaderKind, HeaderReader},
             metrics::*,
+            peer_test::{PeerTestManager, PeerTestManagerEvent},
             session::{
                 active::{Ssu2Session, Ssu2SessionContext},
                 pending::{
@@ -175,6 +176,9 @@ pub struct Ssu2Socket<R: Runtime> {
     /// Outbound state.
     outbound_state: Bytes,
 
+    /// Peer test manager.
+    peer_test_manager: PeerTestManager<R>,
+
     /// Pending outbound sessions.
     ///
     /// Remote routers' intro keys indexed by their socket addresses.
@@ -235,12 +239,16 @@ impl<R: Runtime> Ssu2Socket<R> {
             .update(static_key.public().to_vec())
             .finalize();
 
+        // TODO: pass intro key
+        let peer_test_manager = PeerTestManager::new(intro_key, socket.clone(), router_ctx.clone());
+
         Self {
             active_sessions: R::join_set(),
             chaining_key: Bytes::from(chaining_key),
             inbound_state: Bytes::from(inbound_state),
             intro_key,
             outbound_state: Bytes::from(outbound_state),
+            peer_test_manager,
             pending_outbound: HashMap::new(),
             pending_pkts: VecDeque::new(),
             pending_sessions: R::join_set(),
@@ -328,6 +336,32 @@ impl<R: Runtime> Ssu2Socket<R> {
 
                 Ok(())
             }
+            Ok(HeaderKind::PeerTest {
+                net_id,
+                pkt_num,
+                src_id,
+            }) => {
+                if net_id != self.router_ctx.net_id() {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        our_net_id = ?self.router_ctx.net_id(),
+                        their_net_id = ?net_id,
+                        "network id mismatch",
+                    );
+                    return Err(Ssu2Error::NetworkMismatch);
+                }
+
+                self.peer_test_manager
+                    .handle_peer_test(src_id, pkt_num, datagram, address)
+                    .inspect_err(|error| {
+                        tracing::debug!(
+                            target: LOG_TARGET,
+                            ?src_id,
+                            ?error,
+                            "failed to handle out-of-session peer test message",
+                        );
+                    })
+            }
             _ => match self.pending_outbound.get(&address) {
                 Some(intro_key) =>
                     match self.sessions.get_mut(&reader.reset_key(*intro_key).dst_id()) {
@@ -364,6 +398,7 @@ impl<R: Runtime> Ssu2Socket<R> {
         let router_id = router_info.identity.id();
         let intro_key = router_info.ssu2_intro_key().expect("to succeed");
         let static_key = router_info.ssu2_static_key().expect("to succeed");
+        let verifying_key = router_info.identity.signing_key().clone();
         let address = router_info
             .addresses
             .get(&TransportKind::Ssu2)
@@ -403,6 +438,7 @@ impl<R: Runtime> Ssu2Socket<R> {
                 router_id,
                 router_info,
                 rx,
+                verifying_key,
                 socket: self.socket.clone(),
                 src_id,
                 state,
@@ -466,12 +502,19 @@ impl<R: Runtime> Ssu2Socket<R> {
             }
         };
 
+        // get handle to peer test manager.
+        let handle = self.peer_test_manager.handle();
+
+        // register session to `PeerTestManager`
+        self.peer_test_manager.add_session(&context.router_id, handle.cmd_tx());
+
         self.active_sessions.push(
             Ssu2Session::<R>::new(
                 context,
                 self.socket.clone(),
                 self.transport_tx.clone(),
-                self.router_ctx.metrics_handle().clone(),
+                self.router_ctx.clone(),
+                handle,
             )
             .run(),
         );
@@ -515,6 +558,7 @@ impl<R: Runtime> Ssu2Socket<R> {
                     recv_key_ctx,
                     router_id,
                     send_key_ctx,
+                    ..
                 } = context;
 
                 self.terminating_session.push(TerminatingSsu2Session::<R>::new(
@@ -616,6 +660,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                     "terminate active ssu2 session",
                 );
 
+                this.peer_test_manager.remove_session(&router_id);
                 this.terminating_session.push(TerminatingSsu2Session::<R>::new(termination_ctx));
                 this.router_ctx.metrics_handle().gauge(NUM_CONNECTIONS).decrement(1);
 
@@ -672,9 +717,17 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                             pkt,
                             target,
                             k_header_2,
+                            router_info,
+                            serialized,
                             ..
                         } => {
                             let router_id = context.router_id.clone();
+
+                            // add router to router storage so we can later on use it for outbound
+                            // connections
+                            this.router_ctx
+                                .profile_storage()
+                                .discover_router(*router_info, serialized);
 
                             match this.unvalidated_sessions.get(&router_id) {
                                 None => {
@@ -716,6 +769,7 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                             context,
                             src_id,
                             started: _,
+                            external_address,
                         } => {
                             let router_id = context.router_id.clone();
 
@@ -741,6 +795,12 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
                                     "unvalidated session already exists",
                                 );
                                 debug_assert!(false);
+                            }
+
+                            // report external address to `PeerTestManager` so it can be used
+                            // for status detection and active peer tests
+                            if let Some(address) = external_address {
+                                this.peer_test_manager.add_external_address(address);
                             }
 
                             return Poll::Ready(Some(TransportEvent::ConnectionEstablished {
@@ -856,6 +916,14 @@ impl<R: Runtime> Stream for Ssu2Socket<R> {
             }
         }
 
+        match this.peer_test_manager.poll_next_unpin(cx) {
+            Poll::Pending => {}
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(Some(PeerTestManagerEvent::FirewallStatus { status })) =>
+                return Poll::Ready(Some(TransportEvent::FirewallStatus { status })),
+            Poll::Ready(Some(PeerTestManagerEvent::ExternalAddress { .. })) => {}
+        }
+
         self.waker = Some(cx.waker().clone());
         Poll::Pending
     }
@@ -867,6 +935,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        crypto::SigningPublicKey,
         events::EventManager,
         i2np::{Message, MessageType, I2NP_MESSAGE_EXPIRATION},
         primitives::RouterInfoBuilder,
@@ -925,13 +994,16 @@ mod tests {
                 k_data: [0xee; 32],
                 k_header_2: [0xff; 32],
             },
+            verifying_key: SigningPublicKey::from_bytes(&[0x22; 32]).unwrap(),
         };
+        let handle = socket.peer_test_manager.handle();
         socket.active_sessions.push(
             Ssu2Session::<MockRuntime>::new(
                 context,
                 udp_socket,
                 socket.transport_tx.clone(),
-                socket.router_ctx.metrics_handle().clone(),
+                socket.router_ctx.clone(),
+                handle,
             )
             .run(),
         );

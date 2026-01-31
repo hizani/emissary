@@ -17,16 +17,18 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::chachapoly::ChaChaPoly,
+    crypto::{chachapoly::ChaChaPoly, SigningPublicKey},
     error::Ssu2Error,
     i2np::Message,
-    primitives::RouterId,
+    primitives::{RouterId, RouterInfo},
+    router::context::RouterContext,
     runtime::{Counter, MetricsHandle, Runtime, UdpSocket},
     subsystem::{OutboundMessage, OutboundMessageRecycle, SubsystemEvent},
     transport::{
         ssu2::{
             message::{data::DataMessageBuilder, Block, HeaderKind, HeaderReader},
             metrics::*,
+            peer_test::types::PeerTestHandle,
             session::{
                 active::{
                     ack::{AckInfo, RemoteAckManager},
@@ -44,10 +46,10 @@ use crate::{
 };
 
 use bytes::BytesMut;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use thingbuf::mpsc::{with_recycle, Receiver, Sender};
 
-use alloc::{collections::VecDeque, sync::Arc, vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
 use core::{
     cmp::min,
     future::Future,
@@ -61,6 +63,7 @@ use core::{
 mod ack;
 mod duplicate;
 mod fragment;
+mod peer_test;
 mod transmission;
 
 // TODO: move code from `TransmissionManager` into here?
@@ -173,6 +176,9 @@ pub struct Ssu2SessionContext {
 
     /// Key context for outbound packets.
     pub send_key_ctx: KeyContext,
+
+    /// Verifying key of remote router.
+    pub verifying_key: SigningPublicKey,
 }
 
 /// Active SSU2 session.
@@ -200,15 +206,20 @@ pub struct Ssu2Session<R: Runtime> {
     /// Packet number of the packet that last requested an immediate ACK.
     last_immediate_ack: u32,
 
-    /// Metrics handle.
-    metrics: R::MetricsHandle,
-
     /// RX channel for receiving messages from `SubsystemManager`.
     msg_rx: Receiver<OutboundMessage, OutboundMessageRecycle>,
 
     /// TX channel given to `SubsystemManager` which it uses
     /// to send messages to this connection.
     msg_tx: Sender<OutboundMessage, OutboundMessageRecycle>,
+
+    /// Peer test handle.
+    peer_test_handle: PeerTestHandle,
+
+    /// Pending router info for a peer test.
+    ///
+    /// Sent by Bob in a `RouterInfo` block bundled together with a `PeerTest` block.
+    pending_router_info: Option<Box<RouterInfo>>,
 
     /// Next packet number.
     pkt_num: Arc<AtomicU32>,
@@ -225,6 +236,9 @@ pub struct Ssu2Session<R: Runtime> {
     /// Resend timer.
     resend_timer: Option<R::Timer>,
 
+    /// Router context.
+    router_ctx: RouterContext<R>,
+
     /// ID of the remote router.
     router_id: RouterId,
 
@@ -240,6 +254,9 @@ pub struct Ssu2Session<R: Runtime> {
     /// TX channel for communicating with `SubsystemManager`.
     transport_tx: Sender<SubsystemEvent>,
 
+    /// Verifying key of remote router.
+    verifying_key: SigningPublicKey,
+
     /// Write buffer
     write_buffer: VecDeque<BytesMut>,
 }
@@ -250,9 +267,11 @@ impl<R: Runtime> Ssu2Session<R> {
         context: Ssu2SessionContext,
         socket: R::UdpSocket,
         transport_tx: Sender<SubsystemEvent>,
-        metrics: R::MetricsHandle,
+        router_ctx: RouterContext<R>,
+        peer_test_handle: PeerTestHandle,
     ) -> Self {
         let (msg_tx, msg_rx) = with_recycle(CMD_CHANNEL_SIZE, OutboundMessageRecycle::default());
+        let metrics = router_ctx.metrics_handle().clone();
         let pkt_num = Arc::new(AtomicU32::new(1u32));
 
         tracing::debug!(
@@ -270,19 +289,22 @@ impl<R: Runtime> Ssu2Session<R> {
             fragment_handler: FragmentHandler::<R>::new(metrics.clone()),
             intro_key: context.intro_key,
             last_immediate_ack: 0u32,
-            metrics: metrics.clone(),
             msg_rx,
             msg_tx,
+            peer_test_handle,
+            pending_router_info: None,
             pkt_num: Arc::clone(&pkt_num),
             pkt_rx: context.pkt_rx,
             recv_key_ctx: context.recv_key_ctx,
             remote_ack: RemoteAckManager::new(),
             resend_timer: None,
+            router_ctx,
             router_id: context.router_id.clone(),
             send_key_ctx: context.send_key_ctx,
             socket,
             transmission: TransmissionManager::<R>::new(context.router_id, pkt_num, metrics),
             transport_tx,
+            verifying_key: context.verifying_key,
             write_buffer: VecDeque::new(),
         }
     }
@@ -301,7 +323,7 @@ impl<R: Runtime> Ssu2Session<R> {
                 expiration = ?message.expiration,
                 "discarding expired message",
             );
-            self.metrics.counter(EXPIRED_PKT_COUNT).increment(1);
+            self.router_ctx.metrics_handle().counter(EXPIRED_PKT_COUNT).increment(1);
             return;
         }
 
@@ -313,7 +335,7 @@ impl<R: Runtime> Ssu2Session<R> {
                 message_type = ?message.message_type,
                 "ignoring duplicate message",
             );
-            self.metrics.counter(DUPLICATE_PKT_COUNT).increment(1);
+            self.router_ctx.metrics_handle().counter(DUPLICATE_PKT_COUNT).increment(1);
             return;
         }
 
@@ -374,6 +396,7 @@ impl<R: Runtime> Ssu2Session<R> {
                 target: LOG_TARGET,
                 router_id = %self.router_id,
                 ?error,
+                ?payload,
                 "failed to parse message block",
             );
             Ssu2Error::Malformed
@@ -481,8 +504,23 @@ impl<R: Runtime> Ssu2Session<R> {
                 Block::Address { .. } | Block::DateTime { .. } | Block::Padding { .. } => {
                     self.remote_ack.register_non_ack_eliciting_pkt(pkt_num);
                 }
+                Block::PeerTest { message } => {
+                    self.remote_ack.register_pkt(pkt_num);
+                    self.ack_timer.schedule_ack(self.transmission.round_trip_time());
+                    self.handle_peer_test_message(message);
+                }
+                Block::RouterInfo { router_info, .. } => {
+                    tracing::trace!(
+                        target: LOG_TARGET,
+                        router_id = %self.router_id,
+                        received_router_id = %router_info.identity.id(),
+                        "received an in-session router info",
+                    );
+
+                    self.pending_router_info = Some(router_info);
+                }
                 block => {
-                    tracing::debug!(
+                    tracing::warn!(
                         target: LOG_TARGET,
                         router_id = %self.router_id,
                         ?block,
@@ -492,6 +530,11 @@ impl<R: Runtime> Ssu2Session<R> {
                 }
             }
         }
+
+        // clear the pending router if it exists
+        //
+        // currently it's only used to handle peer test messages
+        self.pending_router_info.take();
 
         Ok(())
     }
@@ -550,7 +593,10 @@ impl<R: Runtime> Ssu2Session<R> {
         let Some(packets_to_resend) = self.transmission.resend()? else {
             return Ok(0);
         };
-        self.metrics.counter(RETRANSMISSION_COUNT).increment(packets_to_resend.len());
+        self.router_ctx
+            .metrics_handle()
+            .counter(RETRANSMISSION_COUNT)
+            .increment(packets_to_resend.len());
 
         let AckInfo {
             highest_seen,
@@ -700,6 +746,14 @@ impl<R: Runtime> Future for Ssu2Session<R> {
             }
         }
 
+        loop {
+            match self.peer_test_handle.poll_next_unpin(cx) {
+                Poll::Pending => break,
+                Poll::Ready(None) => return Poll::Ready(TerminationReason::RouterShutdown),
+                Poll::Ready(Some(command)) => self.handle_peer_test_command(command),
+            }
+        }
+
         // send all outbound packets
         {
             let address = self.address;
@@ -768,10 +822,15 @@ impl<R: Runtime> Future for Ssu2Session<R> {
 mod tests {
     use super::*;
     use crate::{
+        crypto::SigningPrivateKey,
+        events::EventManager,
         i2np::{MessageType, I2NP_MESSAGE_EXPIRATION},
-        primitives::MessageId,
+        primitives::{MessageId, RouterInfoBuilder},
+        profile::ProfileStorage,
         runtime::mock::MockRuntime,
+        transport::ssu2::peer_test::types::PeerTestEventRecycle,
     };
+    use bytes::Bytes;
     use thingbuf::mpsc::channel;
 
     #[tokio::test]
@@ -784,6 +843,20 @@ mod tests {
             <MockRuntime as Runtime>::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
                 .await
                 .unwrap();
+        let remote_signing_key = SigningPrivateKey::random(&mut rand::thread_rng());
+        let (router_info, static_key, signing_key) = RouterInfoBuilder::default().build();
+        let (_event_mgr, _event_subscriber, event_handle) =
+            EventManager::new(None, MockRuntime::register_metrics(vec![], None));
+        let router_ctx = RouterContext::new(
+            MockRuntime::register_metrics(vec![], None),
+            ProfileStorage::<MockRuntime>::new(&Vec::new(), &Vec::new()),
+            router_info.identity.id(),
+            Bytes::from(router_info.serialize(&signing_key)),
+            static_key.clone(),
+            signing_key,
+            2u8,
+            event_handle.clone(),
+        );
 
         let ctx = Ssu2SessionContext {
             address: recv_socket.local_address().unwrap(),
@@ -799,19 +872,17 @@ mod tests {
                 k_data: [3u8; 32],
                 k_header_2: [2u8; 32],
             },
+            verifying_key: remote_signing_key.public(),
         };
+        let (event_tx, _event_rx) = with_recycle(16, PeerTestEventRecycle::default());
+        let handle = PeerTestHandle::new(event_tx);
 
         let cmd_tx = {
             let (transport_tx, transport_rx) = channel(16);
 
             tokio::spawn(
-                Ssu2Session::<MockRuntime>::new(
-                    ctx,
-                    socket,
-                    transport_tx,
-                    MockRuntime::register_metrics(vec![], None),
-                )
-                .run(),
+                Ssu2Session::<MockRuntime>::new(ctx, socket, transport_tx, router_ctx, handle)
+                    .run(),
             );
 
             match transport_rx.recv().await.unwrap() {
@@ -930,6 +1001,20 @@ mod tests {
             <MockRuntime as Runtime>::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
                 .await
                 .unwrap();
+        let remote_signing_key = SigningPrivateKey::random(&mut rand::thread_rng());
+        let (router_info, static_key, signing_key) = RouterInfoBuilder::default().build();
+        let (_event_mgr, _event_subscriber, event_handle) =
+            EventManager::new(None, MockRuntime::register_metrics(vec![], None));
+        let router_ctx = RouterContext::new(
+            MockRuntime::register_metrics(vec![], None),
+            ProfileStorage::<MockRuntime>::new(&Vec::new(), &Vec::new()),
+            router_info.identity.id(),
+            Bytes::from(router_info.serialize(&signing_key)),
+            static_key.clone(),
+            signing_key,
+            2u8,
+            event_handle.clone(),
+        );
 
         let ctx = Ssu2SessionContext {
             address: recv_socket.local_address().unwrap(),
@@ -945,17 +1030,15 @@ mod tests {
                 k_data: [3u8; 32],
                 k_header_2: [2u8; 32],
             },
+            verifying_key: remote_signing_key.public(),
         };
+        let (event_tx, _event_rx) = with_recycle(16, PeerTestEventRecycle::default());
+        let handle = PeerTestHandle::new(event_tx);
 
         let (cmd_tx, handle) = {
             let handle = tokio::spawn(
-                Ssu2Session::<MockRuntime>::new(
-                    ctx,
-                    socket,
-                    transport_tx,
-                    MockRuntime::register_metrics(vec![], None),
-                )
-                .run(),
+                Ssu2Session::<MockRuntime>::new(ctx, socket, transport_tx, router_ctx, handle)
+                    .run(),
             );
 
             match transport_rx.recv().await.unwrap() {
