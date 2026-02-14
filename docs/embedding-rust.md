@@ -4,9 +4,9 @@ outline: deep
 
 # Embedding `emissary` into Rust applications
 
-This page describes how to embed `emissary` into a Rust application. Full code is available on [Github](https://github.com/altonen/emissary/tree/master/examples/rust-tutorial/src/main.rs).
+This page describes how to embed `emissary` into a Rust application. Full code is available on [Github](https://github.com/eepnet/emissary/tree/master/examples/rust-tutorial/src/main.rs).
 
-Additionally, there is an example project on [Github](https://github.com/altonen/emissary/tree/master/examples/rust-chat) that shows how to embed `emissary` into a chat application. The project also shows how to interact with the embedded router over SAMv3.
+Additionally, there is an example project on [Github](https://github.com/eepnet/emissary/tree/master/examples/rust-chat) that shows how to embed `emissary` into a chat application. The project also shows how to interact with the embedded router over SAMv3.
 
 ## Initializing router storage
 
@@ -188,4 +188,4 @@ tokio::spawn(async move {
 
 Interacting with the router happens over [SAMv3](https://geti2p.net/en/docs/api/samv3) and [I2CP](https://geti2p.net/spec/i2cp). `emissary-cli` uses [`yosemite`](https://docs.rs/yosemite/latest/yosemite/) as its SAMv3 client library but there are other Rust SAMv3 client libraries such as [`i2p-rs`](https://github.com/i2p/i2p-rs/) and [`solitude`](https://github.com/syvita/solitude).
 
-See [this example](https://github.com/altonen/emissary/tree/master/examples/rust-chat) for instruction on how to host and interact with I2P hidden services from Rust.
+See [this example](https://github.com/eepnet/emissary/tree/master/examples/rust-chat) for instruction on how to host and interact with I2P hidden services from Rust.

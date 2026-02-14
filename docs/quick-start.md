@@ -4,7 +4,7 @@ outline: deep
 
 # Quick start
 
-*Prebuilt binaries for Windows are available on [Github](https://github.com/altonen/emissary/releases)*
+*Prebuilt binaries for Windows are available on [Github](https://github.com/eepnet/emissary/releases)*
 
 ### Installing `emissary-cli`
 
@@ -17,7 +17,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 #### Build `emissary-cli` from source
 
 ```bash
-git clone https://github.com/altonen/emissary
+git clone https://github.com/eepnet/emissary
 cd emissary
 cargo build --release
 ```

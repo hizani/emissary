@@ -1,7 +1,7 @@
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/altonen/emissary"
+repository = "https://github.com/eepnet/emissary"
 description = "Rust implementation of the I2P protocol stack"
 readme = "README.md"
 authors = []

@@ -1,6 +1,6 @@
 ## emissary
 
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/altonen/emissary/blob/master/LICENSE) [![Crates.io](https://img.shields.io/crates/v/emissary-core.svg)](https://crates.io/crates/emissary-core) [![docs.rs](https://img.shields.io/docsrs/emissary-core.svg)](https://docs.rs/emissary-core/latest/emissary_core/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/eepnet/emissary/blob/master/LICENSE) [![Crates.io](https://img.shields.io/crates/v/emissary-core.svg)](https://crates.io/crates/emissary-core) [![docs.rs](https://img.shields.io/docsrs/emissary-core.svg)](https://docs.rs/emissary-core/latest/emissary_core/)
 
 ![UI](docs/router-ui.webp)
 
@@ -29,7 +29,7 @@
 1) Install from [crates.io](https://crates.io/crates/emissary-cli): `cargo install emissary-cli`
 2) Build from sources: `cargo build --release`
 
-Router installs its files under `$HOME/.emissary`, automatically reseeds over HTTPS on first boot and creates a default configuration. For instructions on how to browse and host eepsites, use torrents, or chat on Irc2P, visit [documentation](https://altonen.github.io/emissary/).
+Router installs its files under `$HOME/.emissary`, automatically reseeds over HTTPS on first boot and creates a default configuration. For instructions on how to browse and host eepsites, use torrents, or chat on Irc2P, visit [documentation](https://eepnet.github.io/emissary/).
 
 ### Third-Party Licenses
 

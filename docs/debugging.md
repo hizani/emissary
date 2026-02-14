@@ -64,7 +64,7 @@ emissary-cli -lemissary::tunnel::transit=trace,emissary::tunnel::pool=off
 * `i2cp`
   * enable `TRACE` for all I2CP-related subsystems
 * `sam`
-  * enable `TRACE` for all SAM-related subsystems, including [`yosemite`](https://github.com/altonen/yosemite)
+  * enable `TRACE` for all SAM-related subsystems, including [`yosemite`](https://github.com/eepnet/yosemite)
 * `transit`
   * enable `TRACE` for transit tunnels and `DEBUG` for transport manager
 
