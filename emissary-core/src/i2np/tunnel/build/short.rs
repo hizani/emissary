@@ -28,7 +28,7 @@ use nom::{
     number::complete::{be_u32, be_u8},
     Err, IResult,
 };
-use rand_core::RngCore;
+use rand::CryptoRng;
 
 use alloc::{vec, vec::Vec};
 
@@ -122,7 +122,7 @@ impl<'a> TunnelBuildRecordBuilder<'a> {
     }
 
     /// Returns a full-length build record (218) of random bytes.
-    pub fn random<R: RngCore>(rng: &mut R) -> Vec<u8> {
+    pub fn random<R: CryptoRng>(rng: &mut R) -> Vec<u8> {
         let mut out = vec![0u8; 218];
         rng.fill_bytes(&mut out);
 
@@ -130,7 +130,7 @@ impl<'a> TunnelBuildRecordBuilder<'a> {
     }
 
     /// Serialize `TunnelBuildRecordBuilder`.
-    pub fn serialize(self, rng: &mut impl RngCore) -> Vec<u8> {
+    pub fn serialize(self, rng: &mut impl CryptoRng) -> Vec<u8> {
         let mut out = BytesMut::with_capacity(154 + AES256_IV_LEN);
 
         out.put_u32(*self.tunnel_id.expect("to exist"));
@@ -237,6 +237,7 @@ impl TunnelBuildRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{mock::MockRuntime, Runtime};
 
     #[test]
     fn all_zero_bytes() {
@@ -248,13 +249,15 @@ mod tests {
             .with_request_time(0)
             .with_request_expiration(0)
             .with_next_message_id(MessageId::from(0))
-            .serialize(&mut rand_core::OsRng);
+            .serialize(&mut MockRuntime::rng());
 
         assert!(TunnelBuildRecord::parse(&serialized).is_ok());
     }
 
     #[test]
     fn invalid_role() {
+        use rand::Rng;
+
         let mut out = BytesMut::with_capacity(154 + AES256_IV_LEN);
 
         out.put_u32(0u32);
@@ -270,7 +273,7 @@ mod tests {
         out.put_u16(0u16); // options
 
         let mut padding = vec![0u8; out.capacity() - out.len() - AES256_IV_LEN];
-        rand_core::OsRng.fill_bytes(&mut padding);
+        MockRuntime::rng().fill_bytes(&mut padding);
         out.put_slice(&padding);
 
         let serialized = out.freeze().to_vec();
@@ -283,6 +286,8 @@ mod tests {
 
     #[test]
     fn options_parsed_correctly() {
+        use rand::Rng;
+
         let mut out = BytesMut::with_capacity(154 + AES256_IV_LEN);
 
         out.put_u32(0u32);
@@ -311,7 +316,7 @@ mod tests {
         }
 
         let mut padding = vec![0u8; out.capacity() - out.len() - AES256_IV_LEN];
-        rand_core::OsRng.fill_bytes(&mut padding);
+        MockRuntime::rng().fill_bytes(&mut padding);
         out.put_slice(&padding);
 
         let serialized = out.freeze().to_vec();

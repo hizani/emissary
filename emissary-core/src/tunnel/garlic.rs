@@ -37,7 +37,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use rand_core::RngCore;
+use rand::Rng;
 #[cfg(test)]
 use zeroize::Zeroize;
 
@@ -258,15 +258,15 @@ mod tests {
         runtime::mock::MockRuntime,
     };
     use bytes::{BufMut, Bytes, BytesMut};
-    use rand_core::RngCore;
+    use rand::Rng;
     use std::time::Duration;
 
     #[test]
     fn serialize_deserialize() {
-        let remote_key = StaticPrivateKey::random(rand::thread_rng());
+        let remote_key = StaticPrivateKey::random(rand::rng());
         let remote_router_id = Bytes::from(RouterId::random().to_vec());
 
-        let local_key = StaticPrivateKey::random(rand::thread_rng());
+        let local_key = StaticPrivateKey::random(rand::rng());
         let local_router_id = Bytes::from(RouterId::random().to_vec());
 
         let mut garlic = GarlicHandler::<MockRuntime>::new(
@@ -328,7 +328,7 @@ mod tests {
 
         // derive outbound garlic context
         let local_noise = NoiseContext::new(local_key, local_router_id);
-        let ephemeral_secret = EphemeralPrivateKey::random(rand::thread_rng());
+        let ephemeral_secret = EphemeralPrivateKey::random(rand::rng());
         let ephemeral_public = ephemeral_secret.public();
         let (local_key, local_state) =
             local_noise.derive_outbound_garlic_key(remote_key.public(), ephemeral_secret);
@@ -396,10 +396,10 @@ mod tests {
 
     #[test]
     fn expired_garlic_clove() {
-        let remote_key = StaticPrivateKey::random(rand::thread_rng());
+        let remote_key = StaticPrivateKey::random(rand::rng());
         let remote_router_id = Bytes::from(RouterId::random().to_vec());
 
-        let local_key = StaticPrivateKey::random(rand::thread_rng());
+        let local_key = StaticPrivateKey::random(rand::rng());
         let local_router_id = Bytes::from(RouterId::random().to_vec());
 
         let mut garlic = GarlicHandler::<MockRuntime>::new(
@@ -437,7 +437,7 @@ mod tests {
 
         // derive outbound garlic context
         let local_noise = NoiseContext::new(local_key, local_router_id);
-        let ephemeral_secret = EphemeralPrivateKey::random(rand::thread_rng());
+        let ephemeral_secret = EphemeralPrivateKey::random(rand::rng());
         let ephemeral_public = ephemeral_secret.public();
         let (local_key, local_state) =
             local_noise.derive_outbound_garlic_key(remote_key.public(), ephemeral_secret);

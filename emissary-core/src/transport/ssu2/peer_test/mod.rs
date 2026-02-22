@@ -33,7 +33,7 @@ use crate::{
 use bytes::{BufMut, BytesMut};
 use futures::{FutureExt, Stream};
 use hashbrown::{HashMap, HashSet};
-use rand_core::RngCore;
+use rand::Rng;
 use thingbuf::mpsc::{with_recycle, Receiver, Sender};
 
 use alloc::{boxed::Box, collections::VecDeque, vec, vec::Vec};
@@ -1358,7 +1358,6 @@ mod tests {
     };
     use bytes::{BufMut, Bytes};
     use futures::StreamExt;
-    use rand::RngCore;
     use std::time::Duration;
     use thingbuf::mpsc::channel;
 

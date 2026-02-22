@@ -383,15 +383,15 @@ impl RouterInfoBuilder {
     /// Build [`RouterInfoBuilder`] into a [`RouterInfo].
     pub fn build(&mut self) -> (RouterInfo, StaticPrivateKey, SigningPrivateKey) {
         use crate::{runtime::mock::MockRuntime, Ntcp2Config, Ssu2Config};
-        use rand_core::RngCore;
+        use rand::Rng;
 
         let static_key = match self.static_key.take() {
             Some(key) => StaticPrivateKey::from_bytes(&key).unwrap(),
-            None => StaticPrivateKey::random(rand::thread_rng()),
+            None => StaticPrivateKey::random(MockRuntime::rng()),
         };
         let signing_key = match self.signing_key.take() {
             Some(key) => SigningPrivateKey::from_bytes(&key).unwrap(),
-            None => SigningPrivateKey::random(rand::thread_rng()),
+            None => SigningPrivateKey::random(MockRuntime::rng()),
         };
         let identity = RouterIdentity::from_keys::<MockRuntime>(&static_key, &signing_key)
             .expect("to succeed");

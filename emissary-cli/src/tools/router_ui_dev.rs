@@ -25,7 +25,7 @@ use emissary_core::{
     runtime::Runtime,
 };
 use emissary_util::runtime::tokio::Runtime as TokioRuntime;
-use rand::Rng;
+use rand::RngExt;
 
 use std::time::Duration;
 
@@ -60,10 +60,10 @@ impl RouterState {
     async fn run(mut self) {
         loop {
             {
-                let mut rng = rand::thread_rng();
+                let mut rng = TokioRuntime::rng();
 
                 let mut delta = |value: usize, max_change: i32| -> usize {
-                    let change: i32 = rng.gen_range(-max_change..=max_change);
+                    let change: i32 = rng.random_range(-max_change..=max_change);
                     let new = value as i32 + change;
                     new.max(0) as usize
                 };
@@ -133,17 +133,18 @@ pub async fn run() {
 
         let dir = tempdir().expect("to succeed");
         let base_path = dir.path().to_owned();
-        let storage = Storage::new(Some(base_path.clone())).await.unwrap();
-        let mut config = Config::parse(&Arguments::default(), &storage).await.unwrap();
+        let storage = Storage::new::<TokioRuntime>(Some(base_path.clone())).await.unwrap();
+        let mut config =
+            Config::parse::<TokioRuntime>(&Arguments::default(), &storage).await.unwrap();
 
-        println!("confguration path = {}", base_path.display());
+        println!("configuration path = {}", base_path.display());
 
         let _ = ui::native::RouterUi::start(
             subscriber,
             config.config.take().unwrap(),
             base_path,
             None,
-            RouterId::from(rand::thread_rng().gen::<[u8; 32]>()),
+            RouterId::from(TokioRuntime::rng().random::<[u8; 32]>()),
             shutdown_tx,
         );
     }
