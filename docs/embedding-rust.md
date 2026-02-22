@@ -17,7 +17,7 @@ Additionally, there is an example project on [Github](https://github.com/eepnet/
 If `None` is given, `Storage` initializes the router storage to `$HOME/.emissary`.
 
 ```rust
-let storage = Storage::new(Some(base_path)).await?;
+let storage = Storage::new::<Runtime>(Some(base_path)).await?;
 ```
 
 After the storage has been initialized, `Storage::load()` can be used to read a storage bundle which contains all the necessary on-disk information needed to initialize the router. This includes stored router infos and peer profiles, router and transport keys and the `routerInfo` of the embedded router, if it exist.
@@ -44,7 +44,7 @@ When the router is started, it should check if `routers` in the `StorageBundle` 
 
 ```rust
 if routers.is_empty() {
-    match Reseeder::reseed(None, false).await {
+    match Reseeder::reseed::<Runtime>(None, false).await {
         Ok(reseed_routers) =>
             for info in reseed_routers {
                 let _ = storage.store_router_info(
@@ -100,7 +100,7 @@ let config = Config {
     transit: Some(TransitConfig {
         max_tunnels: Some(1000),
     }),
-    ..Default::default()
+    ..Config::new::<Runtime>()
 };
 ```
 
